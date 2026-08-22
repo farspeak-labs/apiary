@@ -40,6 +40,61 @@ fn default_home() -> PathBuf {
         .join(".apiary")
 }
 
+/// Headless unlock: the opt-in passphrase file behind the cockpit's
+/// "remember on this host" checkbox. A host that must run agents through
+/// reboots and deploys holds its own key — like an SSH host key — so the
+/// keystore's at-rest protection here reduces to OS account permissions
+/// (0600) and disk encryption. Forgetting it in the cockpit deletes it.
+fn headless_unlock_path(home: &std::path::Path) -> PathBuf {
+    home.join("headless-unlock")
+}
+
+fn write_headless_unlock(path: &std::path::Path, passphrase: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).map_err(|e| e.to_string())?;
+    f.write_all(passphrase.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// Read + verify the stored passphrase; None (with a loud note) if the
+/// file is absent, unreadable, or no longer matches the keystore.
+fn read_headless_unlock(home: &std::path::Path) -> Option<String> {
+    let path = headless_unlock_path(home);
+    let pass = std::fs::read_to_string(&path)
+        .ok()?
+        .trim_end_matches('\n')
+        .to_string();
+    if pass.is_empty() {
+        return None;
+    }
+    let verified = apiary_core::keystore::Keystore::open(home)
+        .map_err(|e| e.to_string())
+        .and_then(|ks| {
+            ks.verify_or_initialize_workspace(&pass)
+                .map_err(|e| e.to_string())
+        });
+    match verified {
+        Ok(_) => {
+            eprintln!("headless unlock: workspace unlocked from {}", path.display());
+            Some(pass)
+        }
+        Err(e) => {
+            eprintln!(
+                "headless unlock: {} no longer opens the keystore ({e}) — staying locked; \
+                 unlock in the cockpit and re-tick \"remember on this host\"",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -72,12 +127,27 @@ async fn main() {
     let desktop_token = apiary_core::identity::generate()
         .secret_key()
         .to_secret_hex();
+    // Explicit --passphrase / APIARY_PASSPHRASE wins; otherwise the opt-in
+    // headless-unlock file lets agents come back up unattended.
+    let stored = read_headless_unlock(&args.home);
+    let auto = stored.is_some();
+    let initial_pass = args.passphrase.clone().or(stored);
+    let remember_home = args.home.clone();
+    let forget_home = args.home.clone();
     let state = Arc::new(AppState {
         home: args.home.clone(),
-        passphrase: std::sync::RwLock::new(args.passphrase.clone()),
-        remember_passphrase: None,
-        forget_passphrase: None,
-        automatic_unlock: std::sync::atomic::AtomicBool::new(false),
+        passphrase: std::sync::RwLock::new(initial_pass),
+        remember_passphrase: Some(Arc::new(move |pass: &str| {
+            write_headless_unlock(&headless_unlock_path(&remember_home), pass)
+        })),
+        forget_passphrase: Some(Arc::new(move || {
+            match std::fs::remove_file(headless_unlock_path(&forget_home)) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
+        })),
+        automatic_unlock: std::sync::atomic::AtomicBool::new(auto),
         auth,
         origin: args
             .origin
