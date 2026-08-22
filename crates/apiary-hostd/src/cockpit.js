@@ -3029,6 +3029,82 @@ async function renderRoutines(c) {
     st.textContent = r.ok ? `added ${name} — now ratify in Configuration` : 'failed: ' + r.error;
     if (r.ok) { loadRoster(); setTimeout(render, 800); }
   };
+
+  await renderWatches(c, d.manifest || {});
+}
+
+// Watches: the event-triggered half of the Automations tab.
+async function renderWatches(c, manifest) {
+  const d = await j(api('/watches'));
+  if (!d.ok) return;
+  const sec = section('Watches',
+    'The agent acts because something changed, not because you spoke or a clock struck. A watch is a door you ratify in advance: the trigger is never the authority, and what it carries reaches the run as data, never as instructions. Each fire is an ordinary governed run, paid for out of the proactive allowance.');
+  if (d.note) sec.append(el('div', 'ev err', d.note));
+  if (!(d.watches || []).length) sec.append(kv('watches', 'none yet — add one below, then ratify in Configuration'));
+  for (const w of (d.watches || [])) {
+    const box = el('div', 'ev');
+    const head = el('div', 'row');
+    const flag = !w.enabled ? ' · disabled' : w.running ? ' · running now' : w.pending_since ? ' · change pending' : '';
+    head.append(el('b', null, w.name), el('span', 'meta', `${w.on}: ${w.vault || ''}${w.match ? ' / ' + w.match : ''}${flag}`));
+    box.append(head, kv('task', w.task));
+    box.append(kv('bounds', `settles for ${w.debounce} before running · at most ${w.max_per_day}×/day · ${w.fires_today} today`));
+    box.append(kv('deliver', (w.deliver || []).length
+      ? w.deliver.map(x => x.telegram ? `telegram ${x.telegram}` : x.buzz ? `buzz #${x.buzz}` : x.nostr ? 'nostr publish' : x.companion ? 'companion' : '?').join(', ')
+      : 'nothing — silent unless the agent speaks for itself'));
+    if (w.pending_paths && w.pending_paths.length) box.append(kv('waiting on', w.pending_paths.slice(0, 6).join(', ') + (w.pending_paths.length > 6 ? ` +${w.pending_paths.length - 6} more` : '')));
+    box.append(kv('last', w.last_fired ? `${tsText(w.last_fired)} → ${w.last_outcome || '?'}` : 'never'));
+    // Quiet runs are the point, not a failure: show them so "nothing to do"
+    // and "broken" are distinguishable at a glance.
+    box.append(kv('runs', `${w.quiet_runs} found nothing worth doing · ${w.acting_runs} changed something`));
+    if (w.note) box.append(kv('supervisor', w.note));
+    sec.append(box);
+  }
+  c.append(sec);
+
+  const vaults = (manifest.memory || {}).vaults || [];
+  const add = section('Add a watch',
+    'Writes an amendment to the manifest — re-ratify in Configuration afterward. Watches need a proactive allowance to run.');
+  if (!vaults.length) {
+    add.append(help('This agent has no vaults yet. Grant one under Capabilities first — a watch can only watch something the agent was already given.'));
+    c.append(add);
+    return;
+  }
+  const wName = el('input'); wName.placeholder = 'name (e.g. project-changed)';
+  const wVault = el('select');
+  vaults.forEach(v => { const o = el('option', null, `${v.name} (${v.path})`); o.value = v.name; wVault.append(o); });
+  const wMatch = el('input'); wMatch.placeholder = 'only files matching (e.g. PROJECT.md) — optional';
+  const wTask = el('textarea'); wTask.rows = 3; wTask.placeholder = 'what should the agent do when this changes?';
+  const wDebounce = el('input'); wDebounce.placeholder = 'settle for'; wDebounce.value = '5m';
+  const wMax = el('input'); wMax.placeholder = 'max runs/day'; wMax.value = '12';
+  const wBudget = el('input'); wBudget.placeholder = 'tokens/run'; wBudget.value = '8000';
+  const wGo = el('button', 'btn solid', 'ADD (AMEND MANIFEST)');
+  const wSt = el('span', 'meta', '');
+  const wr1 = el('div', 'row'); wr1.append(wName, wVault, wMatch);
+  const wr2 = el('div', 'row'); wr2.append(wDebounce, wMax, wBudget);
+  const wr3 = el('div', 'row'); wr3.append(wGo, wSt);
+  add.append(wr1, wTask, wr2,
+    help('“Settle for” coalesces a burst of edits into one run — save ten files in a minute and the agent runs once. The daily maximum refuses rather than queueing: a backlog that fires at midnight is worse than a gap.'),
+    wr3);
+  c.append(add);
+  wGo.onclick = async () => {
+    const name = wName.value.trim().replace(/[^A-Za-z0-9_-]/g, '-');
+    if (!name || !wTask.value.trim()) { wSt.textContent = 'name and task are required'; return; }
+    const m = await j(api('/manifest'));
+    if (!m.ok) { wSt.textContent = 'failed: ' + m.error; return; }
+    let yaml = m.yaml.replace(/\s+$/, '');
+    const q = s => JSON.stringify(String(s));
+    let entry = `- name: ${name}\n  on: vault\n  vault: ${q(wVault.value)}\n`;
+    if (wMatch.value.trim()) entry += `  match: ${q(wMatch.value.trim())}\n`;
+    entry += `  task: |\n` + wTask.value.trim().split('\n').map(l => '    ' + l).join('\n') + '\n';
+    entry += `  debounce: ${q(wDebounce.value.trim() || '5m')}\n`;
+    entry += `  max_per_day: ${parseInt(wMax.value, 10) || 12}\n`;
+    if (wBudget.value.trim()) entry += `  budget:\n    tokens_per_run: ${parseInt(wBudget.value, 10) || 8000}\n`;
+    if (/^watches:/m.test(yaml)) yaml += '\n' + entry;
+    else yaml += '\nwatches:\n' + entry;
+    const r = await j(api('/manifest'), { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml }) });
+    wSt.textContent = r.ok ? `added ${name} — now ratify in Configuration` : 'failed: ' + r.error;
+    if (r.ok) { loadRoster(); setTimeout(render, 800); }
+  };
 }
 
 async function renderConnectors(c) {

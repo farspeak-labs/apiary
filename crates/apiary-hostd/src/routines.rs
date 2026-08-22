@@ -124,7 +124,7 @@ pub fn reconcile_routines(state: &App) {
     }
 }
 
-fn note(state: &App, npub: &str, name: &str, msg: String) {
+pub(crate) fn note(state: &App, npub: &str, name: &str, msg: String) {
     state
         .supervisor_notes
         .lock()
@@ -132,8 +132,9 @@ fn note(state: &App, npub: &str, name: &str, msg: String) {
         .insert(format!("{npub}:routine:{name}"), msg);
 }
 
-/// None = clear to fire. Some(reason) = don't.
-fn gate(
+/// None = clear to fire. Some(reason) = don't. Shared with watches:
+/// an event-triggered run passes exactly the gates a scheduled one does.
+pub(crate) fn gate(
     state: &App,
     npub: &str,
     raw: &str,
@@ -317,7 +318,7 @@ fn fire(
 /// One delivery target. Uses the same paths as presence replies and
 /// telegram_send — same allowlists, same voice behavior.
 #[allow(clippy::too_many_arguments)]
-fn deliver(
+pub(crate) fn deliver(
     state: &App,
     manifest: &Manifest,
     custody: &apiary_core::custody::Custody,

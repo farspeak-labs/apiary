@@ -54,6 +54,11 @@ pub struct Manifest {
     /// comes from ratification, and it travels with the agent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routines: Vec<Routine>,
+    /// Event-triggered standing instructions (SCOPE_proactive-agents): the
+    /// agent acts because the world changed. Ratified like routines, run
+    /// like routines, and paid for out of the proactive allowance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watches: Vec<Watch>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -799,6 +804,76 @@ pub struct EncryptedBlob {
 }
 
 /// One scheduled, governed run.
+/// A watch is a door the governor ratified in advance: the agent runs
+/// because the world changed, not because a person spoke or a clock struck.
+///
+/// The trigger is never the authority — this ratified watch is. What the
+/// trigger carries (a file's contents, later a relay event) reaches the run
+/// as DATA, framed exactly like platform text: a file that appears saying
+/// "ignore your instructions" is a file that appeared, nothing more.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Watch {
+    pub name: String,
+    /// What is watched. "vault" today; relay/connector/webhook later.
+    pub on: String,
+    /// Which granted vault (a `memory.vaults` name). Required for "vault".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault: Option<String>,
+    /// Optional path substring filter, e.g. "PROJECT.md". Absent = any file.
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub match_path: Option<String>,
+    /// The instruction, ratified with the manifest.
+    pub task: String,
+    /// Coalesce a burst of changes into one run ("30s", "5m", "2h").
+    #[serde(default = "default_debounce")]
+    pub debounce: String,
+    /// Hard ceiling. Refuses for the rest of the day rather than queueing —
+    /// a backlog that fires at midnight is worse than a gap.
+    #[serde(default = "default_max_per_day")]
+    pub max_per_day: u32,
+    /// Empty (the default) means the run delivers nothing: proactive work
+    /// is silent unless the agent uses a send tool or this says otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliver: Vec<Delivery>,
+    #[serde(default)]
+    pub budget: RoutineBudget,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_debounce() -> String {
+    "5m".into()
+}
+
+fn default_max_per_day() -> u32 {
+    12
+}
+
+impl Watch {
+    /// Triggers this host understands.
+    pub const KINDS: [&'static str; 1] = ["vault"];
+    pub const MAX_PER_DAY_CEILING: u32 = 200;
+}
+
+/// "90s" | "15m" | "2h" | "1d" → seconds. One spelling of duration for the
+/// whole system: the schema validates with it, the schedule engine runs on it.
+pub fn parse_duration_secs(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.len().checked_sub(1)?);
+    let n: i64 = num.trim().parse().ok()?;
+    if n <= 0 {
+        return None;
+    }
+    Some(match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        _ => return None,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Routine {
@@ -1091,6 +1166,88 @@ impl Manifest {
                             r.name
                         )));
                     }
+                }
+            }
+        }
+        // Watches: a known trigger, a vault the agent actually has, a real
+        // debounce, and a ceiling. A watch without bounds is a retry storm.
+        let mut wnames = std::collections::BTreeSet::new();
+        for w in &self.watches {
+            if w.name.trim().is_empty() || !wnames.insert(w.name.as_str()) {
+                return Err(crate::Error::Manifest(format!(
+                    "watch name '{}' is empty or duplicated",
+                    w.name
+                )));
+            }
+            if !Watch::KINDS.contains(&w.on.as_str()) {
+                return Err(crate::Error::Manifest(format!(
+                    "watch '{}': unknown trigger '{}' (this host watches: {})",
+                    w.name,
+                    w.on,
+                    Watch::KINDS.join(", ")
+                )));
+            }
+            if w.task.trim().is_empty() {
+                return Err(crate::Error::Manifest(format!(
+                    "watch '{}' has an empty task",
+                    w.name
+                )));
+            }
+            if w.on == "vault" {
+                let Some(vault) = w.vault.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+                    return Err(crate::Error::Manifest(format!(
+                        "watch '{}' watches a vault but names none",
+                        w.name
+                    )));
+                };
+                if !self.memory.vaults.iter().any(|v| v.name == vault) {
+                    return Err(crate::Error::Manifest(format!(
+                        "watch '{}' watches vault '{vault}', which this agent has not been \
+                         granted (memory.vaults)",
+                        w.name
+                    )));
+                }
+            }
+            if parse_duration_secs(&w.debounce).is_none() {
+                return Err(crate::Error::Manifest(format!(
+                    "watch '{}': debounce '{}' is not a duration like 30s, 5m, 2h",
+                    w.name, w.debounce
+                )));
+            }
+            if w.max_per_day == 0 || w.max_per_day > Watch::MAX_PER_DAY_CEILING {
+                return Err(crate::Error::Manifest(format!(
+                    "watch '{}': max_per_day must be between 1 and {}",
+                    w.name,
+                    Watch::MAX_PER_DAY_CEILING
+                )));
+            }
+            for d in &w.deliver {
+                let targets = [
+                    d.telegram.is_some(),
+                    d.buzz.is_some(),
+                    d.nostr.is_some(),
+                    d.companion,
+                ]
+                .iter()
+                .filter(|b| **b)
+                .count();
+                if targets != 1 {
+                    return Err(crate::Error::Manifest(format!(
+                        "watch '{}': each deliver entry names exactly one target",
+                        w.name
+                    )));
+                }
+                if d.telegram.is_some() && self.presence.channel("telegram").is_none() {
+                    return Err(crate::Error::Manifest(format!(
+                        "watch '{}' delivers to telegram but the agent has no telegram presence",
+                        w.name
+                    )));
+                }
+                if d.buzz.is_some() && self.presence.channel("buzz").is_none() {
+                    return Err(crate::Error::Manifest(format!(
+                        "watch '{}' delivers to buzz but the agent has no buzz presence",
+                        w.name
+                    )));
                 }
             }
         }

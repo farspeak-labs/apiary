@@ -18,6 +18,7 @@ pub mod proposal;
 pub mod publish;
 pub mod relay;
 pub mod routines;
+pub mod watches;
 pub mod routing;
 pub mod runner;
 pub mod slack;

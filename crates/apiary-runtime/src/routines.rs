@@ -149,22 +149,9 @@ fn parse_tz(r: &apiary_core::manifest::Routine) -> Result<chrono_tz::Tz, crate::
     })
 }
 
-/// "15m" | "2h" | "1d" | "90s" → seconds.
-pub fn parse_duration_secs(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let (num, unit) = s.split_at(s.len().checked_sub(1)?);
-    let n: i64 = num.trim().parse().ok()?;
-    if n <= 0 {
-        return None;
-    }
-    Some(match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86_400,
-        _ => return None,
-    })
-}
+/// "15m" | "2h" | "1d" | "90s" → seconds. Defined in the schema crate so
+/// validation and scheduling can never disagree about what a duration is.
+pub use apiary_core::manifest::parse_duration_secs;
 
 impl Schedule {
     /// The next fire strictly after `after`. `anchor` is the reference for
