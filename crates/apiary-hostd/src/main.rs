@@ -124,9 +124,26 @@ async fn main() {
             eprintln!("error: host manager registry: {error}");
             std::process::exit(2);
         });
-    let desktop_token = apiary_core::identity::generate()
-        .secret_key()
-        .to_secret_hex();
+    // Reuse the published desktop credential across restarts. Minting a
+    // fresh one every launch meant every deploy silently signed the desktop
+    // app out ("desktop credential was refused") — the operator pays for the
+    // daemon's restart with a login. The file is 0600 and readable only by
+    // the account that administers this host (which can already reach the
+    // keystore); rotation is `rm desktop-access.json` + restart.
+    let desktop_token = std::fs::read_to_string(args.home.join("desktop-access.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("token")
+                .and_then(|t| t.as_str())
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            apiary_core::identity::generate()
+                .secret_key()
+                .to_secret_hex()
+        });
     // Explicit --passphrase / APIARY_PASSPHRASE wins; otherwise the opt-in
     // headless-unlock file lets agents come back up unattended.
     let stored = read_headless_unlock(&args.home);
