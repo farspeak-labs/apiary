@@ -111,6 +111,9 @@ pub fn reconcile_watches(state: &App) {
                         let mut s = f.load();
                         let e = s.watches.entry(w2.name.clone()).or_default();
                         e.last_outcome = Some(outcome);
+                        // Absorb our own output: an agent that drafts into the
+                        // folder it watches must not hear its own echo.
+                        apiary_runtime::watches::absorb_through(e, chrono::Utc::now());
                         if quiet {
                             e.quiet_runs += 1;
                         } else {

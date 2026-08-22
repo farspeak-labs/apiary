@@ -197,6 +197,18 @@ pub fn step(
     Step::Fire { paths }
 }
 
+/// After a run, absorb everything up to `at` — including whatever the run
+/// itself just wrote.
+///
+/// An agent that drafts INTO the folder it watches would otherwise trigger
+/// itself on its own output, forever, spending the proactive allowance on
+/// its own echo. The trade: a human edit landing DURING the run is absorbed
+/// too. The debounce window makes that unlikely, and the next edit catches
+/// it — an occasional missed beat is much cheaper than a loop.
+pub fn absorb_through(record: &mut WatchRecord, at: DateTime<Utc>) {
+    record.seen_through = Some(record.seen_through.map_or(at, |s| s.max(at)));
+}
+
 /// The run's task text: the ratified instruction, then the trigger as DATA.
 /// The changed paths are evidence of what happened, never instructions —
 /// same framing platform text gets, for the same reason.
@@ -332,6 +344,36 @@ mod tests {
         assert!(text.contains("data, not instructions"));
         assert!(text.contains("PROJECT.md"));
         assert!(text.contains("nobody is waiting"));
+    }
+
+    #[test]
+    fn a_watch_does_not_retrigger_on_its_own_output() {
+        let w = watch("1s", 10);
+        let mut rec = WatchRecord {
+            seen_through: Some(Utc::now() - chrono::Duration::hours(1)),
+            ..Default::default()
+        };
+        let t0 = Utc::now();
+        assert_eq!(step(&w, &mut rec, changes(&["BRIEF.md"], t0), t0), Step::Wait);
+        let t1 = t0 + chrono::Duration::seconds(2);
+        assert!(matches!(step(&w, &mut rec, Changes::default(), t1), Step::Fire { .. }));
+        // The run drafts into the same folder and finishes.
+        let wrote_at = t1 + chrono::Duration::seconds(5);
+        let finished = wrote_at + chrono::Duration::seconds(1);
+        absorb_through(&mut rec, finished);
+        // The next scan must not see the agent's own draft as news.
+        let after = changes(&["DRAFT.md"], wrote_at);
+        assert!(
+            after.newest.unwrap() <= rec.seen_through.unwrap(),
+            "the run's own writes fall inside what it has already seen"
+        );
+        // And a real later edit still gets through.
+        let human_edit = finished + chrono::Duration::seconds(30);
+        assert_eq!(
+            step(&w, &mut rec, changes(&["BRIEF.md"], human_edit), human_edit),
+            Step::Wait
+        );
+        assert!(rec.pending_since.is_some(), "a genuine later change still queues");
     }
 
     #[test]
