@@ -21,7 +21,9 @@
   header .sub { color:var(--dim); font-size:14px; white-space:nowrap; }
   .header-spacer { flex:1; }
   .header-actions { display:flex; align-items:center; gap:8px; }
-  .chip { appearance:none; background:transparent; font:13px/1.2 var(--sans); padding:7px 11px; border-radius:7px; border:1px solid var(--line); color:var(--dim); cursor:default; }
+  /* inline-block + nowrap: an inline chip wraps INSIDE itself ("name ·" /
+     "R/W") and its borders then overlap the row below. */
+  .chip { appearance:none; display:inline-block; white-space:nowrap; vertical-align:top; margin:0 4px 4px 0; background:transparent; font:13px/1.2 var(--sans); padding:7px 11px; border-radius:7px; border:1px solid var(--line); color:var(--dim); cursor:default; }
   button.chip { cursor:pointer; }
   button.chip:hover { color:var(--text); border-color:var(--amber-soft); background:var(--panel); }
   .chip.ok { color:var(--ok); border-color:#4c6840; }

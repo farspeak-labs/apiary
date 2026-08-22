@@ -387,6 +387,73 @@ function mcpToolPolicyObject(policies) {
   return Object.fromEntries([...policies.entries()].sort(([a], [b]) => a.localeCompare(b)));
 }
 
+// Library entries are templates, so their tool list is the DEFAULT a future
+// grant starts from. Editing it here means a new agent arrives configured
+// instead of inert. An OAuth entry holds no credential of its own, so
+// discovery borrows one from an agent that already has the grant; failing
+// that, names can be typed — a library entry should never be uneditable
+// just because nothing has been granted yet.
+function libraryToolEditor(card, entry, caps, holders, saveLib) {
+  const row = el('div', 'row');
+  const btn = el('button', 'btn', 'EDIT TOOLS');
+  const st = el('span', 'meta', '');
+  row.append(btn, st);
+  const box = el('div');
+  card.append(row, box);
+
+  const applyRow = (getTools, getAccess) => {
+    const apply = el('button', 'btn solid', 'SAVE AS DEFAULT');
+    const aSt = el('span', 'meta', '');
+    const r = el('div', 'row'); r.append(apply, aSt);
+    apply.onclick = async () => {
+      const tools = getTools();
+      caps.allowed_tools = tools;
+      const access = getAccess ? getAccess() : null;
+      if (access && Object.keys(access).length) { caps.tool_access = access; caps.access = 'mixed'; }
+      else delete caps.tool_access;
+      entry.caps = caps;
+      aSt.textContent = 'saving…';
+      window.__libFlash = `${entry.name}: ${tools.length} tool${tools.length === 1 ? '' : 's'} set as the default for future grants (existing grants keep their own list — change those on the agent’s Capabilities)`;
+      await saveLib();
+    };
+    return r;
+  };
+
+  btn.onclick = async () => {
+    box.replaceChildren();
+    const oauth = !!(caps.oauth || caps.oauth_client_id);
+    const key = caps.library_name || entry.name;
+    let tools = null;
+    if (oauth && holders.length) {
+      st.textContent = `probing with ${holders[0].name}’s credential…`;
+      const r = await j(`/api/agents/${encodeURIComponent(holders[0].npub)}/connectors/${encodeURIComponent(key)}/discover`,
+        { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+      if (r.ok) { tools = r.tools; st.textContent = `${r.tools.length} tools · via ${holders[0].name}`; }
+      else st.textContent = 'discovery failed: ' + r.error;
+    } else if (!oauth) {
+      st.textContent = 'probing…';
+      const r = await j('/api/connectors/discover',
+        { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ caps }) });
+      if (r.ok) { tools = r.tools; st.textContent = `${r.tools.length} tools`; }
+      else st.textContent = 'discovery failed: ' + r.error;
+    } else {
+      st.textContent = 'This server signs in per agent, and nobody holds it yet — grant it to an agent and discover there, or type the tool names below.';
+    }
+    if (tools) {
+      const policies = mcpToolPolicies(tools, caps);
+      renderMcpToolPolicyPicker(box, tools, policies);
+      box.append(applyRow(() => Object.keys(mcpToolPolicyObject(policies)), () => mcpToolPolicyObject(policies)));
+    } else {
+      const manual = el('input', 'grow');
+      manual.placeholder = 'tool names, comma separated (* allows every tool)';
+      manual.value = (caps.allowed_tools || []).join(', ');
+      box.append(field('Tools', manual),
+        help('Typed names are not verified against the server. Discovery is better when it is available — this is here so an entry is never stuck.'));
+      box.append(applyRow(() => manual.value.split(',').map(t => t.trim()).filter(Boolean), null));
+    }
+  };
+}
+
 function renderMcpToolPolicyPicker(root, tools, policies) {
   root.replaceChildren();
   const groups = new Map();
@@ -3303,7 +3370,7 @@ function connectorDetails(card, kind, caps, onAccess) {
     else for (const t of tools) {
       const policy = caps.tool_access && caps.tool_access[t];
       const chip = el('span', 'chip', policy ? `${t} · ${policy === 'read-only' ? 'R' : 'R/W'}` : t);
-      chip.style.marginRight = '4px'; tv.append(chip);
+      tv.append(chip);
     }
     const row = el('div', 'kv'); row.append(el('span', 'k', 'tools'), tv); card.append(row);
   } else if (kind === 'nostr-publish') {
@@ -3359,11 +3426,16 @@ async function renderLibrary(c) {
 
   // Which agents hold a grant of each kind — the all-agents view.
   const grantsByKind = {};
+  // Who holds each library entry, by npub — an OAuth-backed entry has no
+  // credential of its own, so discovery has to borrow a grantee's.
+  const holdersByEntry = {};
   for (const a of agents) {
     const d = await j(`/api/agents/${encodeURIComponent(a.npub)}/manifest`);
     if (!d.ok) continue;
     for (const g of (d.manifest.connectors || [])) {
       (grantsByKind[g.type] = grantsByKind[g.type] || []).push(a.name || shortNostrId(a.npub));
+      const key = g.caps && (g.caps.library_name || g.caps.url || g.caps.command);
+      if (key) (holdersByEntry[key] = holdersByEntry[key] || []).push({ npub: a.npub, name: a.name || shortNostrId(a.npub) });
     }
   }
 
@@ -3403,6 +3475,11 @@ async function renderLibrary(c) {
         select.disabled = false;
         if (!ok) { setConnectorAccess(e.kind, caps, previous); select.value = previous; }
       });
+      if (e.kind === 'mcp') {
+        libraryToolEditor(card, e, caps,
+          holdersByEntry[caps.library_name || e.name] || holdersByEntry[caps.url] || holdersByEntry[caps.command] || [],
+          saveLib);
+      }
       // Who has it, and grant from here.
       const gRow = el('div', 'row');
       gRow.append(el('span', 'meta', holders.length ? 'granted to: ' + holders.join(', ') : 'granted to: nobody yet'));
