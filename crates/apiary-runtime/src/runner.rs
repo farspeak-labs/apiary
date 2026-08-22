@@ -49,6 +49,10 @@ pub struct RunOutcome {
     pub slot: String,
     pub log_event_id: String,
     pub timings: RunTimings,
+    /// A tool that changes something ran successfully. False means the run
+    /// only observed — the host's basis for recording a proactive run as
+    /// quiet, established by what happened rather than by what was said.
+    pub acted: bool,
 }
 
 /// Stage-boundary events for observers (the AG-UI stream, the cockpit).
@@ -296,6 +300,11 @@ pub fn run_task_observed(
         );
         let _ = reservation_guard.release();
     };
+    // Did this run CHANGE anything, or only look? The host's own answer, from
+    // the connectors' `observes_only` declarations — a proactive run earns
+    // "quiet" by observation, never by claiming it. Spans retries, because a
+    // side effect in a failed attempt still happened.
+    let acted = std::cell::Cell::new(false);
     let (completion, slot_name, inference_harness) = 'attempts: loop {
         let index = attempt_failures.len();
         let slot_name = candidates
@@ -396,6 +405,9 @@ pub fn run_task_observed(
                     })?;
                 let started = std::time::Instant::now();
                 let result = connector.execute(custody, agent, args);
+                if !connector.observes_only() && result.is_ok() {
+                    acted.set(true);
+                }
                 tools_ms.set(tools_ms.get() + elapsed_ms(started));
                 emit(RunEvent::ToolCallFinished {
                     name: name.into(),
@@ -562,6 +574,7 @@ pub fn run_task_observed(
         slot: slot_name,
         log_event_id: event.id.to_hex(),
         timings,
+        acted: acted.get(),
     })
 }
 

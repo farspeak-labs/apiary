@@ -28,6 +28,16 @@ pub trait Connector {
         agent: &AgentHandle,
         args: &Value,
     ) -> Result<String, crate::Error>;
+    /// Does this tool only LOOK at the world? Reading, searching, listing:
+    /// true. Sending, writing, publishing, proposing: false.
+    ///
+    /// The host uses this to answer "did anything actually happen?" without
+    /// asking the model to tell it — which is how a proactive run earns the
+    /// right to be recorded as quiet. Defaults to false so a connector
+    /// added later is assumed to act until it says otherwise.
+    fn observes_only(&self) -> bool {
+        false
+    }
 }
 
 /// The connector kinds this host can bind — the one list (README:
@@ -522,6 +532,12 @@ struct McpToolConnector {
 }
 
 impl Connector for McpToolConnector {
+    /// The server's own readOnlyHint. Unmarked tools count as acting —
+    /// same fail-closed reading the read-only cap already applies.
+    fn observes_only(&self) -> bool {
+        self.tool.read_only
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: self.model_name.clone(),
@@ -698,6 +714,10 @@ struct WebSearch {
 }
 
 impl Connector for WebSearch {
+    fn observes_only(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "web_search".into(),
@@ -999,6 +1019,10 @@ struct WebFetch {
 }
 
 impl Connector for WebFetch {
+    fn observes_only(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         let access = if self.allow_all_public {
             "all public HTTPS websites".to_string()
@@ -1424,6 +1448,10 @@ fn hidden_component(path: &str) -> bool {
 struct FilesList(FileSettings);
 
 impl Connector for FilesList {
+    fn observes_only(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "files_list".into(),
@@ -1491,6 +1519,10 @@ impl Connector for FilesList {
 struct FilesRead(FileSettings);
 
 impl Connector for FilesRead {
+    fn observes_only(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "files_read".into(),
@@ -1542,6 +1574,10 @@ impl Connector for FilesRead {
 struct FilesSearch(FileSettings);
 
 impl Connector for FilesSearch {
+    fn observes_only(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "files_search".into(),
@@ -1676,6 +1712,10 @@ struct GitRead {
 }
 
 impl Connector for GitRead {
+    fn observes_only(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         let repos = self
             .roots
@@ -1949,6 +1989,10 @@ struct VaultList {
 }
 
 impl Connector for VaultList {
+    fn observes_only(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: format!("{}_list", self.kind),
@@ -2119,6 +2163,10 @@ struct VaultSearch {
 }
 
 impl Connector for VaultSearch {
+    fn observes_only(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: format!("{}_search", self.kind),
@@ -2182,6 +2230,10 @@ struct VaultRead {
 }
 
 impl Connector for VaultRead {
+    fn observes_only(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: format!("{}_read", self.kind),
@@ -2581,5 +2633,32 @@ mod connector_security_tests {
         assert!(mcp_tool_allowed(&write, &[], false, false, &granular));
         let unsafe_read = std::collections::HashMap::from([("write".to_string(), true)]);
         assert!(!mcp_tool_allowed(&write, &[], false, false, &unsafe_read));
+    }
+
+    /// "Did anything happen?" must fail closed: a connector that has not
+    /// declared itself an observer counts as acting, so a proactive run
+    /// can never be recorded as quiet because someone forgot to answer.
+    #[test]
+    fn observes_only_defaults_to_acting() {
+        struct Undeclared;
+        impl Connector for Undeclared {
+            fn def(&self) -> ToolDef {
+                ToolDef {
+                    name: "undeclared".into(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                }
+            }
+            fn execute(
+                &self,
+                _c: &Custody,
+                _a: &AgentHandle,
+                _args: &Value,
+            ) -> Result<String, crate::Error> {
+                Ok(String::new())
+            }
+        }
+        assert!(!Undeclared.observes_only());
+        assert!(!MockEcho.observes_only());
     }
 }
