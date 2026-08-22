@@ -549,6 +549,46 @@ fn snapshot_approved_manifest(dir: &std::path::Path, raw: &str) -> std::io::Resu
     Ok(())
 }
 
+/// The autonomy previously in force for this agent — the last manifest a
+/// ratification approved. Absent (never ratified) means nothing granted.
+pub fn approved_autonomy(dir: &std::path::Path) -> apiary_core::manifest::Autonomy {
+    std::fs::read_to_string(dir.join("manifest.approved.yaml"))
+        .ok()
+        .and_then(|raw| Manifest::from_yaml_unvalidated(&raw).ok())
+        .map(|m| m.governance.autonomy)
+        .unwrap_or_default()
+}
+
+/// **Autonomy can never grant autonomy.** A ratification that widens
+/// `governance.autonomy` must be signed by a person: an identity that is
+/// not itself an agent on this host. Without this rail, one agent holding
+/// `autonomy.ratify` could grant every capability to itself and to every
+/// other agent, and the human door would close behind it.
+pub fn check_autonomy_grant(
+    ks: &Keystore,
+    dir: &std::path::Path,
+    candidate: &Manifest,
+    ratifier: &PublicKey,
+) -> Result<(), String> {
+    let previous = approved_autonomy(dir);
+    if !candidate.governance.autonomy.expands_beyond(&previous) {
+        return Ok(());
+    }
+    let ratifier_npub = apiary_core::identity::to_npub(ratifier).unwrap_or_default();
+    let is_agent = ks
+        .list()
+        .map(|agents| agents.iter().any(|npub| npub == &ratifier_npub))
+        .unwrap_or(false);
+    if is_agent {
+        return Err(format!(
+            "this ratification would grant autonomy ({}) and is signed by an agent. \
+             Autonomy can never grant autonomy: a person must ratify it.",
+            candidate.governance.autonomy.granted().join(", ")
+        ));
+    }
+    Ok(())
+}
+
 pub fn suspend_pks(manifest: &Manifest) -> Vec<PublicKey> {
     let mut keys = manifest
         .governance
@@ -879,6 +919,9 @@ async fn ratify_agent(
             "ratification must be signed by the ratifying key itself (as == request signer)",
         )
         .into_response();
+    }
+    if let Err(e) = check_autonomy_grant(&ks, &dir, &manifest, &ratifier_pk) {
+        return err(StatusCode::FORBIDDEN, e).into_response();
     }
     let pass = match state.passphrase_clone() {
         Some(p) => p,
@@ -1217,6 +1260,65 @@ mod tests {
             admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
             decisions: Default::default(),
         })
+    }
+
+    /// The one rail of full autonomy: a manifest that WIDENS
+    /// governance.autonomy may be ratified by a person, never by an agent
+    /// on this host — otherwise autonomy propagates itself and the human
+    /// door closes for good.
+    #[test]
+    fn autonomy_can_never_grant_autonomy() {
+        let home = std::env::temp_dir().join(format!(
+            "apiary-autonomy-rail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let ks = Keystore::open(&home).unwrap();
+        let pass = "rail-test-passphrase";
+        ks.verify_or_initialize_workspace(pass).unwrap();
+        // A lead agent (in the keystore) and a person (not).
+        let lead = Keys::generate();
+        ks.store(&lead, pass).unwrap();
+        let person = Keys::generate().public_key();
+        let subject = identity::to_npub(&Keys::generate().public_key()).unwrap();
+        let dir = ks.agent_dir(&subject);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let with_autonomy = |flags: &str| -> Manifest {
+            Manifest::from_yaml(&format!(
+                "manifest_version: 1\nidentity:\n  npub: {subject}\ninference:\n  \
+                 - name: brain\n    provider: mock\nrouting:\n  default: brain\n\
+                 memory:\n  log: local\ngovernance:\n  suspend_keys:\n    - {}\n{flags}",
+                identity::to_npub(&person).unwrap()
+            ))
+            .unwrap()
+        };
+        let plain = with_autonomy("");
+        let autonomous = with_autonomy("  autonomy:\n    ratify: true\n    open_credentials: true\n");
+
+        // Nothing granted: either signer may ratify.
+        assert!(check_autonomy_grant(&ks, &dir, &plain, &lead.public_key()).is_ok());
+        assert!(check_autonomy_grant(&ks, &dir, &plain, &person).is_ok());
+        // Granting autonomy: the person may, the agent may not.
+        assert!(check_autonomy_grant(&ks, &dir, &autonomous, &person).is_ok());
+        let refused = check_autonomy_grant(&ks, &dir, &autonomous, &lead.public_key())
+            .expect_err("an agent must not be able to grant autonomy");
+        assert!(refused.contains("Autonomy can never grant autonomy"), "{refused}");
+        assert!(refused.contains("open credentials"), "names what it would grant: {refused}");
+
+        // Once a person HAS granted it, the agent may ratify manifests that
+        // do not widen it further — autonomy is usable, just not self-issued.
+        snapshot_approved_manifest(&dir, &autonomous.to_yaml().unwrap()).unwrap();
+        assert!(check_autonomy_grant(&ks, &dir, &autonomous, &lead.public_key()).is_ok());
+        let wider = with_autonomy(
+            "  autonomy:\n    ratify: true\n    open_credentials: true\n    export: true\n",
+        );
+        assert!(check_autonomy_grant(&ks, &dir, &wider, &lead.public_key()).is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

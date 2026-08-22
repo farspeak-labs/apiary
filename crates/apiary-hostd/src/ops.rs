@@ -2564,6 +2564,11 @@ pub async fn ratify_import(
             .into_response()
         }
     };
+    // Same rail as the local path: an imported ratification event signed by
+    // an agent cannot be the thing that grants autonomy.
+    if let Err(e) = crate::check_autonomy_grant(&ks, &dir, &manifest, &event.pubkey) {
+        return err(StatusCode::FORBIDDEN, e).into_response();
+    }
     let pass = match require_pass(&state) {
         Ok(p) => p,
         Err(e) => return e.into_response(),

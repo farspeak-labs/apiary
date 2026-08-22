@@ -4,6 +4,7 @@
 //! per-agent governor or host-manager gate used by the cockpit and REST API.
 
 use crate::{build_router, nip98, App};
+use apiary_core::keystore::Keystore;
 use axum::{
     body::{to_bytes, Body},
     extract::{OriginalUri, State},
@@ -241,15 +242,22 @@ fn describe() -> Value {
                 "logs, spend and runs", "host managers and connector library"
             ]
         },
-        "excluded": [
-            "/api/unlock", "/api/unlock/forget", "/api/agents/{npub}/credential/open",
-            "/api/agents/{npub}/export", "/api/host/pick-folder", "/api/events"
-        ],
-        "governance": "Writes do not bypass Apiary: constitutional changes invalidate ratification until an authorized governor approves them."
+        "excluded": ["/api/host/pick-folder", "/api/events"],
+        "human_door": {
+            "routes": {
+                "/api/unlock, /api/unlock/forget": "governance.autonomy.unlock",
+                "/api/agents/{npub}/credential/open": "governance.autonomy.open_credentials",
+                "/api/agents/{npub}/export": "governance.autonomy.export"
+            },
+            "rule": "Available only to a caller whose OWN RATIFIED manifest grants that capability. A person grants each one separately and must ratify the grant: autonomy can never grant autonomy, so no agent can widen itself or another. suspend_keys always stops an autonomous agent."
+        },
+        "governance": "Writes do not bypass Apiary: constitutional changes invalidate ratification until an authorized governor approves them. Ratifying is likewise gated — an agent may sign ratifications only where it is a listed governor and holds governance.autonomy.ratify, and never one that grants autonomy."
     })
 }
 
-fn validate_target(method: &Method, target: &str) -> Result<(), (i64, String)> {
+/// Ok(None) = allowed outright; Ok(Some(need)) = allowed only for a caller
+/// granted that autonomy capability; Err = never available through MCP.
+fn validate_target(method: &Method, target: &str) -> Result<Option<AutonomyNeed>, (i64, String)> {
     if !matches!(
         *method,
         Method::GET | Method::POST | Method::PUT | Method::DELETE
@@ -270,19 +278,87 @@ fn validate_target(method: &Method, target: &str) -> Result<(), (i64, String)> {
             "path must be a non-traversing relative /api/... route".into(),
         ));
     }
-    let denied = path == "/api/unlock"
-        || path == "/api/unlock/forget"
-        || path == "/api/events"
-        || path == "/api/host/pick-folder"
-        || path.ends_with("/credential/open")
-        || path.ends_with("/export");
-    if denied {
+    // Never reachable through MCP for anyone: a UI stream and a native
+    // file dialog, neither of which means anything to a protocol client.
+    if path == "/api/events" || path == "/api/host/pick-folder" {
         return Err((
             -32602,
             "that route is intentionally excluded from MCP control".into(),
         ));
     }
-    Ok(())
+    // The human door. Reachable only for a caller whose ratified manifest
+    // grants that specific autonomy capability (see `Autonomy`).
+    let needs = if path == "/api/unlock" || path == "/api/unlock/forget" {
+        Some(AutonomyNeed::Unlock)
+    } else if path.ends_with("/credential/open") {
+        Some(AutonomyNeed::OpenCredentials)
+    } else if path.ends_with("/export") {
+        Some(AutonomyNeed::Export)
+    } else {
+        None
+    };
+    Ok(needs)
+}
+
+/// Which autonomy capability a route demands of its caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutonomyNeed {
+    Unlock,
+    Export,
+    OpenCredentials,
+}
+
+impl AutonomyNeed {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unlock => "unlock",
+            Self::Export => "export",
+            Self::OpenCredentials => "open credentials",
+        }
+    }
+
+    fn granted_by(self, autonomy: &apiary_core::manifest::Autonomy) -> bool {
+        match self {
+            Self::Unlock => autonomy.unlock,
+            Self::Export => autonomy.export,
+            Self::OpenCredentials => autonomy.open_credentials,
+        }
+    }
+}
+
+/// Does this caller hold the capability the route needs? The answer comes
+/// from the caller's own RATIFIED manifest (`manifest.approved.yaml`), never
+/// from the working copy — otherwise an agent able to write its manifest
+/// could widen itself without a ratification.
+fn autonomy_permits(
+    state: &App,
+    signer: Option<PublicKey>,
+    need: AutonomyNeed,
+) -> Result<(), (i64, String)> {
+    let refuse = |detail: &str| {
+        Err((
+            -32602,
+            format!(
+                "'{}' is part of the human door: {detail}. A person grants it \
+                 per capability under governance.autonomy, and must ratify that grant.",
+                need.label()
+            ),
+        ))
+    };
+    let Some(signer) = signer else {
+        return refuse("this call has no authenticated agent identity");
+    };
+    let Ok(npub) = apiary_core::identity::to_npub(&signer) else {
+        return refuse("the caller identity could not be read");
+    };
+    let Ok(ks) = Keystore::open(&state.home) else {
+        return refuse("the keystore is unavailable");
+    };
+    let dir = ks.agent_dir(&npub);
+    if need.granted_by(&crate::approved_autonomy(&dir)) {
+        return Ok(());
+    }
+    refuse("the calling agent has not been granted it")
 }
 
 async fn forward(
@@ -292,7 +368,9 @@ async fn forward(
     target: &str,
     body: Option<Value>,
 ) -> Result<Value, (i64, String)> {
-    validate_target(&method, target)?;
+    if let Some(need) = validate_target(&method, target)? {
+        autonomy_permits(state, signer, need)?;
+    }
     let bytes = match body {
         Some(body) => serde_json::to_vec(&body).map_err(|error| (-32602, error.to_string()))?,
         None => Vec::new(),
@@ -473,13 +551,46 @@ mod tests {
     }
 
     #[test]
-    fn target_validation_blocks_secret_and_escape_routes() {
-        assert!(validate_target(&Method::GET, "/api/agents").is_ok());
-        assert!(validate_target(&Method::POST, "/api/agents/npub1x/active").is_ok());
-        assert!(validate_target(&Method::POST, "/api/agents/x/credential/open").is_err());
-        assert!(validate_target(&Method::POST, "/api/agents/x/export").is_err());
+    fn target_validation_blocks_escape_routes_and_gates_the_human_door() {
+        // Ordinary management: no autonomy needed.
+        assert_eq!(validate_target(&Method::GET, "/api/agents").unwrap(), None);
+        assert_eq!(
+            validate_target(&Method::POST, "/api/agents/npub1x/active").unwrap(),
+            None
+        );
+        // The human door: allowed only against a granted capability.
+        assert_eq!(
+            validate_target(&Method::POST, "/api/agents/x/credential/open").unwrap(),
+            Some(AutonomyNeed::OpenCredentials)
+        );
+        assert_eq!(
+            validate_target(&Method::POST, "/api/agents/x/export").unwrap(),
+            Some(AutonomyNeed::Export)
+        );
+        assert_eq!(
+            validate_target(&Method::POST, "/api/unlock").unwrap(),
+            Some(AutonomyNeed::Unlock)
+        );
+        // Never available to any caller, autonomous or not.
+        assert!(validate_target(&Method::GET, "/api/events").is_err());
+        assert!(validate_target(&Method::POST, "/api/host/pick-folder").is_err());
         assert!(validate_target(&Method::GET, "/api/../secret").is_err());
         assert!(validate_target(&Method::GET, "https://example.com/api/status").is_err());
+    }
+
+    /// The capability check reads the caller's RATIFIED manifest; with no
+    /// grant (and no identity at all) every door route is refused.
+    #[test]
+    fn human_door_refuses_callers_without_a_grant() {
+        let state = test_state();
+        for need in [
+            AutonomyNeed::Unlock,
+            AutonomyNeed::Export,
+            AutonomyNeed::OpenCredentials,
+        ] {
+            let denied = autonomy_permits(&state, None, need).unwrap_err();
+            assert!(denied.1.contains("human door"), "explains itself: {denied:?}");
+        }
     }
 
     #[test]

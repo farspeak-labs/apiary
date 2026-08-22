@@ -662,6 +662,72 @@ pub struct Governance {
     /// system of human-owned floors enforced by the host core.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub budgets: BTreeMap<String, serde_json::Value>,
+    /// Capabilities normally reserved for the human door. Off by default;
+    /// each one must be enabled by a HUMAN ratification (see `Autonomy`).
+    #[serde(default, skip_serializing_if = "Autonomy::is_empty")]
+    pub autonomy: Autonomy,
+}
+
+/// Full-autonomy capabilities — the four things only a person could do.
+///
+/// Apiary's design rests on these being unreachable from the agent surface:
+/// "authority comes from the door", and this is the human door. A lead agent
+/// running lights-out may be granted them per capability, and every use is a
+/// signed log entry — but ONE rail is not negotiable and is enforced in the
+/// ratify path: **autonomy can never grant autonomy.** Enabling any flag
+/// requires a human ratifier, so an autonomous agent cannot widen its own
+/// authority or another agent's. `suspend_keys` always stops it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Autonomy {
+    /// Enact constitutional change: sign the ratification a human normally
+    /// signs. Governance without a person in the loop.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ratify: bool,
+    /// Bring the keystore to life unattended (POST /api/unlock).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unlock: bool,
+    /// Produce a sealed export bundle — memory plus re-sealed credentials,
+    /// addressed to another host. An agent that can export can relocate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub export: bool,
+    /// Open sealed credentials to PLAINTEXT. The widest of the four: a
+    /// holder can act as any provider the agent has, outside Apiary's audit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub open_credentials: bool,
+}
+
+impl Autonomy {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// True if `self` enables anything `previous` did not — the test the
+    /// ratify path applies before accepting an agent's signature.
+    pub fn expands_beyond(&self, previous: &Self) -> bool {
+        (self.ratify && !previous.ratify)
+            || (self.unlock && !previous.unlock)
+            || (self.export && !previous.export)
+            || (self.open_credentials && !previous.open_credentials)
+    }
+
+    /// Human-readable list of what is enabled, for logs and the cockpit.
+    pub fn granted(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.ratify {
+            out.push("ratify");
+        }
+        if self.unlock {
+            out.push("unlock");
+        }
+        if self.export {
+            out.push("export");
+        }
+        if self.open_credentials {
+            out.push("open credentials");
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

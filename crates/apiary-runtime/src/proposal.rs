@@ -48,6 +48,13 @@ pub fn write_proposal(
             "a proposal cannot change who governs the agent (suspend_keys)".into(),
         ));
     }
+    if candidate.governance.autonomy != current.governance.autonomy {
+        return Err(crate::Error::Provider(
+            "a proposal cannot change autonomy — those capabilities are the human door \
+             and are granted only by a person, in the cockpit"
+                .into(),
+        ));
+    }
     let yaml = candidate.to_yaml()?;
     std::fs::write(proposed_path(agent_dir), yaml)?;
     std::fs::write(
