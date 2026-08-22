@@ -218,9 +218,14 @@ impl McpClient {
                     REQUEST_TIMEOUT,
                 )?;
                 if init.get("result").is_none() {
+                    // Show the whole response when there is no `error` to
+                    // quote: "initialize failed: null" tells nobody anything.
+                    let detail = match init.get("error") {
+                        Some(e) => e.to_string(),
+                        None => format!("no result in response: {init}"),
+                    };
                     return Err(crate::Error::Provider(format!(
-                        "mcp initialize failed: {}",
-                        init.get("error").cloned().unwrap_or_default()
+                        "mcp initialize failed: {detail}"
                     )));
                 }
                 self.notify("notifications/initialized", json!({}))?;
@@ -376,6 +381,7 @@ impl McpClient {
                 {
                     *session = Some(sid.to_string());
                 }
+                let status = resp.status();
                 let ct = resp
                     .headers()
                     .get("content-type")
@@ -385,6 +391,16 @@ impl McpClient {
                 let body = resp
                     .text()
                     .map_err(|e| crate::Error::Provider(format!("mcp http body: {e}")))?;
+                // A gateway's own error (403, 502, …) is often valid JSON with
+                // neither result nor error, which used to surface downstream as
+                // "initialize failed: null". Say what actually came back.
+                if !status.is_success() {
+                    return Err(crate::Error::Provider(format!(
+                        "mcp http {} on {method}: {}",
+                        status.as_u16(),
+                        body.chars().take(200).collect::<String>()
+                    )));
+                }
                 if ct.starts_with("text/event-stream") {
                     // Request-scoped SSE: the final response terminates the
                     // stream; take the last data frame with our id.
