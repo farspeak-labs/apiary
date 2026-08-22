@@ -5441,7 +5441,18 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
                         npub.clone(),
                         format!("manifest does not load — everything is stopped: {e}"),
                     );
-                eprintln!("supervisor: manifest for {npub} does not load: {e}");
+                // Once per manifest revision, not once per 10s tick — the
+                // note map above keeps it visible in the UI the whole time.
+                static NOTED: std::sync::OnceLock<Mutex<std::collections::HashMap<String, String>>> =
+                    std::sync::OnceLock::new();
+                let mut noted = NOTED
+                    .get_or_init(Default::default)
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if noted.get(&npub) != Some(&disk_sha) {
+                    noted.insert(npub.clone(), disk_sha.clone());
+                    eprintln!("supervisor: manifest for {npub} does not load: {e}");
+                }
                 None
             }
         };

@@ -389,8 +389,45 @@ fn bind_mcp(
             )))
         }
     };
-    let mut client = crate::mcp::McpClient::connect(binding)?;
-    let tools = client.tools_list()?;
+    // Connect + list with one 401 recovery each: the sealed access token
+    // routinely expires between runs — the refresh token is the durable
+    // grant. Without this every bind (so every mention) dies on a token
+    // that the tool-call path would have refreshed anyway.
+    let auth_required = |e: &crate::Error| {
+        matches!(e, crate::Error::Provider(m) if m.starts_with("mcp-auth-required"))
+    };
+    let refresh_or = |e: crate::Error| match &refresh {
+        Some(r) => refresh_access_token(r).map_err(|re| {
+            crate::Error::Provider(format!(
+                "mcp server rejected the token (401) and the refresh failed ({re}) — \
+                 re-grant the connector to re-authorize"
+            ))
+        }),
+        None => Err(e),
+    };
+    let mut client = match crate::mcp::McpClient::connect(binding.clone()) {
+        Ok(c) => c,
+        Err(e) if auth_required(&e) => {
+            let token = refresh_or(e)?;
+            let binding = match binding {
+                crate::mcp::Binding::Http { url, .. } => crate::mcp::Binding::Http {
+                    url,
+                    bearer: Some(token),
+                },
+                other => other,
+            };
+            crate::mcp::McpClient::connect(binding)?
+        }
+        Err(e) => return Err(e),
+    };
+    let tools = match client.tools_list() {
+        Ok(t) => t,
+        Err(e) if auth_required(&e) => {
+            client.set_bearer(refresh_or(e)?);
+            client.tools_list()?
+        }
+        Err(e) => return Err(e),
+    };
     let wildcard = allowed.iter().any(|a| a == "*");
     let granted: Vec<crate::mcp::McpTool> = tools
         .into_iter()
