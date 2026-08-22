@@ -441,7 +441,11 @@ function libraryToolEditor(card, entry, caps, holders, saveLib) {
     }
     if (tools) {
       const policies = mcpToolPolicies(tools, caps);
-      renderMcpToolPolicyPicker(box, tools, policies);
+      // The picker re-renders itself into its root on every bulk selection,
+      // so the save row has to live OUTSIDE it or it vanishes on first use.
+      const pickerBox = el('div');
+      box.append(pickerBox);
+      renderMcpToolPolicyPicker(pickerBox, tools, policies);
       box.append(applyRow(() => Object.keys(mcpToolPolicyObject(policies)), () => mcpToolPolicyObject(policies)));
     } else {
       const manual = el('input', 'grow');
@@ -3264,7 +3268,11 @@ async function renderConnectors(c) {
         const policies = mcpToolPolicies(r.tools, g.caps || {});
         toolsBox.replaceChildren();
         dSt.textContent = `${r.tools.length} tools — choose category or per-tool access`;
-        renderMcpToolPolicyPicker(toolsBox, r.tools, policies);
+        // Own container: the picker wipes its root whenever a bulk selector
+        // changes, which used to take the APPLY button with it.
+        const pickerBox = el('div');
+        toolsBox.append(pickerBox);
+        renderMcpToolPolicyPicker(pickerBox, r.tools, policies);
         const apply = el('button', 'btn solid', 'APPLY ALLOWLIST (AMEND)');
         const aSt = el('span', 'meta', '');
         const aRow = el('div', 'row'); aRow.append(apply, aSt);
