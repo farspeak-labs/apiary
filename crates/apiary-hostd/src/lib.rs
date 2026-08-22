@@ -319,6 +319,14 @@ pub fn build_router(state: App) -> Router {
         .route("/api/agents/{npub}/name", post(ops::rename_agent))
         .route("/api/agents/{npub}/proposal", get(routines::get_proposal))
         .route(
+            "/api/agents/{npub}/founding-proposal",
+            get(routines::get_founding_proposal),
+        )
+        .route(
+            "/api/agents/{npub}/founding-proposal/{decision}",
+            post(routines::decide_founding_proposal),
+        )
+        .route(
             "/api/agents/{npub}/proposal/{decision}",
             post(routines::decide_proposal),
         )

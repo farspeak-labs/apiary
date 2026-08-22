@@ -1352,6 +1352,50 @@ async function proposalBanner(c) {
   };
 }
 
+// Set when a founding request is approved; renderFound reads it once.
+let foundingPrefill = null;
+
+async function foundingBanner(c) {
+  const p = await j(api('/founding-proposal'));
+  if (!p.ok || !p.pending) return;
+  const q = p.request || {};
+  const box = el('div', 'ev');
+  box.style.borderColor = 'var(--amber)';
+  const who = (agents.find(a => a.npub === sel) || {}).name || 'the agent';
+  box.append(el('b', null, `${who} requests a new agent: “${q.name}” — waiting for you`));
+  box.append(kv('purpose', q.purpose || '—'));
+  if (q.reason) box.append(kv('its reason', q.reason));
+  if (q.role) box.append(kv('role sketch', q.role));
+  if ((q.skills || []).length) box.append(kv('skills', q.skills.join(' · ')));
+  if ((q.connectors || []).length) box.append(kv('would need', q.connectors.join(' · ')));
+  if (q.tokens_per_day) box.append(kv('proposed spend', q.tokens_per_day + ' tokens/day'));
+  box.append(kv('requested', q.at ? new Date(q.at).toLocaleString() : '—'));
+  const row = el('div', 'row');
+  const acc = el('button', 'btn solid', 'Approve — open founding');
+  const rej = el('button', 'btn danger', 'Reject');
+  const why = el('input'); why.placeholder = 'why not? (recorded for the agent)'; why.className = 'grow';
+  const st = el('span', 'meta', '');
+  row.append(acc, rej, why, st);
+  box.append(row, help('Approving only opens the founding flow, prefilled from this request. The new agent still gets your review and ratification before anything runs. The decision is recorded where the requesting agent can read it.'));
+  c.append(box);
+  acc.onclick = async () => {
+    const r = await j(api('/founding-proposal/accept'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    if (!r.ok) { st.textContent = 'Failed: ' + r.error; return; }
+    foundingPrefill = r.request;
+    hostView = 'found';
+    document.querySelectorAll('nav button').forEach(x => x.classList.remove('sel'));
+    render();
+  };
+  rej.onclick = async () => {
+    const r = await j(api('/founding-proposal/reject'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: why.value.trim() }),
+    });
+    st.textContent = r.ok ? 'rejected and recorded' : 'failed: ' + r.error;
+    if (r.ok) setTimeout(render, 500);
+  };
+}
+
 function metric(label, value) {
   const node = el('div', 'metric');
   node.append(el('span', 'label', label), el('span', 'value', value));
@@ -1439,7 +1483,9 @@ function agentLifecycleSection(roster) {
 
 async function renderOverview(c) {
   const roster = agents.find(a => a.npub === sel) || {};
-  const proposal = roster.archived ? Promise.resolve() : proposalBanner(c);
+  const proposal = roster.archived
+    ? Promise.resolve()
+    : proposalBanner(c).then(() => foundingBanner(c));
   const [d, spend, listener, controlTokens] = await Promise.all([
     currentManifest(), j(api('/spend')), j(api('/listener')), j(api('/control-tokens')),
   ]);
@@ -2878,6 +2924,7 @@ function tsText(iso) {
 
 async function renderRoutines(c) {
   await proposalBanner(c);
+  await foundingBanner(c);
   const d = await j(api('/routines'));
   if (!d.ok) { c.append(el('div', 'ev err', 'error: ' + d.error)); return; }
   const sec = section('Routines',
@@ -4022,6 +4069,23 @@ function renderFound(c) {
     'Describe a clear job. Apiary creates a conservative configuration for you to review before anything can run.');
   const fName = el('input'); fName.placeholder = 'e.g. Research assistant';
   const fPurpose = el('textarea'); fPurpose.rows = 4; fPurpose.placeholder = 'What should this agent reliably help you do?';
+  if (foundingPrefill) {
+    const q = foundingPrefill; foundingPrefill = null;
+    const from = agents.find(a => a.npub === q.by);
+    sec.append(el('div', 'state ready',
+      `Prefilled from ${from ? from.name : 'an agent'}’s approved founding request — edit anything before creating.`));
+    fName.value = q.name || '';
+    fPurpose.rows = 10;
+    fPurpose.value = [
+      q.purpose || '',
+      q.role ? `\nRole: ${q.role}` : '',
+      (q.principles || []).length ? `\nPrinciples:\n- ${q.principles.join('\n- ')}` : '',
+      (q.boundaries || []).length ? `\nBoundaries:\n- ${q.boundaries.join('\n- ')}` : '',
+      (q.skills || []).length ? `\nSkills it needs:\n- ${q.skills.join('\n- ')}` : '',
+      (q.connectors || []).length ? `\nCapabilities it needs:\n- ${q.connectors.join('\n- ')}` : '',
+      q.tokens_per_day ? `\nProposed spend ceiling: ${q.tokens_per_day} tokens/day` : '',
+    ].filter(Boolean).join('\n');
+  }
   const people = approvalPeople();
   const fSuspend = el('select', 'grow'); fSuspend.multiple = true;
   fSuspend.size = Math.min(6, Math.max(2, people.length));

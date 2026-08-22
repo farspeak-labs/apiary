@@ -673,6 +673,95 @@ pub async fn get_proposal(
     }
 }
 
+/// GET /api/agents/{npub}/founding-proposal — the pending request to found
+/// a NEW agent, if any (SCOPE_hal-project-management).
+pub async fn get_founding_proposal(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, _npub, dir, _raw, _manifest) =
+        match crate::ops::gate_pub(&state, &headers, "GET", &uri, None, &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    match apiary_runtime::proposal::read_founding_request(&dir) {
+        Some(request) => Json(json!({"ok": true, "pending": true, "request": request})).into_response(),
+        None => Json(json!({"ok": true, "pending": false})).into_response(),
+    }
+}
+
+/// POST /api/agents/{npub}/founding-proposal/{decision} — approve (the
+/// cockpit prefills the founding flow from the returned request; the
+/// ceremony itself stays the ordinary human path) or reject (optional body
+/// {"reason": …}). Both land in the requesting agent's signed log, so the
+/// agent can read the outcome.
+pub async fn decide_founding_proposal(
+    State(state): State<App>,
+    AxPath((npub, decision)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (ks, npub, dir, _raw, _manifest) =
+        match crate::ops::gate_pub(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let Some(request) = apiary_runtime::proposal::read_founding_request(&dir) else {
+        return crate::err(StatusCode::NOT_FOUND, "no pending founding request").into_response();
+    };
+    let accepted = match decision.as_str() {
+        "accept" => true,
+        "reject" => false,
+        other => {
+            return crate::err(
+                StatusCode::BAD_REQUEST,
+                format!("unknown decision '{other}'"),
+            )
+            .into_response()
+        }
+    };
+    let governor_reason = serde_json::from_slice::<serde_json::Value>(&raw_body)
+        .ok()
+        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(String::from))
+        .unwrap_or_default();
+    apiary_runtime::proposal::clear_founding_request(&dir);
+    if let Ok((custody, handle)) = admit_agent(&state, &ks, &npub) {
+        let _ = EpisodicLog::open(&dir).append(
+            &custody,
+            &handle,
+            Tier::Self_,
+            &EntryBody {
+                action: if accepted {
+                    "founding.approved"
+                } else {
+                    "founding.rejected"
+                }
+                .into(),
+                model: None,
+                cost: None,
+                harness: None,
+                outcome: format!("founding request '{}'", request.name),
+                detail: Some(json!({
+                    "request": request,
+                    "governor_reason": governor_reason,
+                })),
+            },
+        );
+    }
+    Json(json!({
+        "ok": true, "accepted": accepted, "request": request,
+        "note": if accepted {
+            "approved — the founding flow is prefilled; the new agent still goes through review and ratification"
+        } else {
+            "rejected and recorded where the agent can read it"
+        },
+    }))
+    .into_response()
+}
+
 /// POST /api/agents/{npub}/proposal/{decision} — accept (write the manifest;
 /// ratify next) or reject. Governor. Both are signed log entries.
 pub async fn decide_proposal(

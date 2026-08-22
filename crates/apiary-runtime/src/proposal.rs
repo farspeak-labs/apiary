@@ -205,6 +205,192 @@ impl crate::connector::Connector for ProposeRoutine {
     }
 }
 
+// ---------------------------------------------------- founding requests
+
+pub const FOUNDING_FILE: &str = "founding.proposed.yaml";
+
+/// A request to found a NEW agent (SCOPE_hal-project-management). The
+/// requesting agent describes the colleague it thinks should exist; the
+/// governor approves (prefilled founding flow) or rejects. Founding stays
+/// a human ceremony — this file is only ever a request.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FoundingRequest {
+    pub name: String,
+    pub purpose: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub principles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boundaries: Vec<String>,
+    /// Skill names / one-line descriptions the new agent would need.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    /// Capabilities it would need, by library name or kind — described,
+    /// never granted here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connectors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_day: Option<u64>,
+    /// Why this agent should exist — shown to the governor.
+    pub reason: String,
+    pub at: String,
+    /// npub of the requesting agent.
+    pub by: String,
+}
+
+pub fn founding_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join(FOUNDING_FILE)
+}
+
+pub fn write_founding_request(
+    agent_dir: &Path,
+    request: &FoundingRequest,
+) -> Result<(), crate::Error> {
+    if request.name.trim().is_empty()
+        || request.purpose.trim().is_empty()
+        || request.reason.trim().is_empty()
+    {
+        return Err(crate::Error::Provider(
+            "a founding request needs name, purpose, and reason".into(),
+        ));
+    }
+    let yaml = serde_yaml::to_string(request)
+        .map_err(|e| crate::Error::Provider(format!("founding request encode: {e}")))?;
+    std::fs::write(founding_path(agent_dir), yaml)?;
+    Ok(())
+}
+
+pub fn read_founding_request(agent_dir: &Path) -> Option<FoundingRequest> {
+    let yaml = std::fs::read_to_string(founding_path(agent_dir)).ok()?;
+    serde_yaml::from_str(&yaml).ok()
+}
+
+pub fn clear_founding_request(agent_dir: &Path) {
+    let _ = std::fs::remove_file(founding_path(agent_dir));
+}
+
+/// `propose_agent` — request the founding of a new agent.
+pub struct ProposeAgent {
+    pub agent_dir: PathBuf,
+    pub npub: String,
+}
+
+impl crate::connector::Connector for ProposeAgent {
+    fn def(&self) -> crate::connector::ToolDef {
+        crate::connector::ToolDef {
+            name: "propose_agent".into(),
+            description:
+                "Request that a NEW agent be founded for a purpose you cannot or should not \
+                 cover yourself. This does NOT create anything: it lands as a founding request \
+                 the governor approves or rejects in the cockpit — founding is always a human \
+                 ceremony. Describe the colleague: purpose, skillset, capabilities it would \
+                 need, spend ceiling. Say in `reason` why it should exist. After filing, tell \
+                 the human in the channel where the need arose. One request at a time; filing \
+                 again replaces your pending one."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "short working name, e.g. 'Docs gardener'"},
+                    "purpose": {"type": "string", "description": "what it should reliably do"},
+                    "role": {"type": "string", "description": "one-sentence constitution role sketch"},
+                    "principles": {"type": "array", "items": {"type": "string"}},
+                    "boundaries": {"type": "array", "items": {"type": "string"}},
+                    "skills": {"type": "array", "items": {"type": "string"}, "description": "skills it would need, one line each"},
+                    "connectors": {"type": "array", "items": {"type": "string"}, "description": "capabilities it would need (library names or kinds)"},
+                    "tokens_per_day": {"type": "integer", "description": "proposed daily spend ceiling"},
+                    "reason": {"type": "string", "description": "why this agent should exist — shown to the governor"}
+                },
+                "required": ["name", "purpose", "reason"]
+            }),
+        }
+    }
+
+    fn execute(
+        &self,
+        _custody: &apiary_core::custody::Custody,
+        _agent: &apiary_core::custody::AgentHandle,
+        args: &Value,
+    ) -> Result<String, crate::Error> {
+        let s = |k: &str| {
+            args[k]
+                .as_str()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let list = |k: &str| -> Vec<String> {
+            args[k]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|v| v.trim().to_string()))
+                        .filter(|v| !v.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let request = FoundingRequest {
+            name: s("name").ok_or_else(|| crate::Error::Provider("name required".into()))?,
+            purpose: s("purpose")
+                .ok_or_else(|| crate::Error::Provider("purpose required".into()))?,
+            role: s("role").unwrap_or_default(),
+            principles: list("principles"),
+            boundaries: list("boundaries"),
+            skills: list("skills"),
+            connectors: list("connectors"),
+            tokens_per_day: args["tokens_per_day"].as_u64(),
+            reason: s("reason").ok_or_else(|| crate::Error::Provider("reason required".into()))?,
+            at: chrono::Utc::now().to_rfc3339(),
+            by: self.npub.clone(),
+        };
+        let name = request.name.clone();
+        write_founding_request(&self.agent_dir, &request)?;
+        Ok(format!(
+            "founding request for '{name}' written. Nothing was created — the governor sees it \
+             in the cockpit and decides. Tell the human it is waiting for their review."
+        ))
+    }
+}
+
+#[cfg(test)]
+mod founding_tests {
+    use super::*;
+
+    #[test]
+    fn founding_request_round_trips_and_validates() {
+        let dir = std::env::temp_dir().join(format!("apiary-founding-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(read_founding_request(&dir).is_none());
+        let request = FoundingRequest {
+            name: "Docs gardener".into(),
+            purpose: "keep the docs pruned".into(),
+            role: "tends documentation".into(),
+            principles: vec!["small commits".into()],
+            boundaries: vec![],
+            skills: vec!["markdown hygiene".into()],
+            connectors: vec!["markdown-vault".into()],
+            tokens_per_day: Some(50_000),
+            reason: "the humans keep forgetting".into(),
+            at: "2026-08-22T00:00:00Z".into(),
+            by: "npub1example".into(),
+        };
+        write_founding_request(&dir, &request).unwrap();
+        let back = read_founding_request(&dir).expect("pending request reads back");
+        assert_eq!(back.name, "Docs gardener");
+        assert_eq!(back.tokens_per_day, Some(50_000));
+        assert_eq!(back.boundaries, Vec::<String>::new());
+        // Missing essentials are refused at write time.
+        let mut invalid = request.clone();
+        invalid.reason = "  ".into();
+        assert!(write_founding_request(&dir, &invalid).is_err());
+        clear_founding_request(&dir);
+        assert!(read_founding_request(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// `propose_amendment` — the whole manifest as YAML; advanced.
 pub struct ProposeAmendment {
     pub agent_dir: PathBuf,

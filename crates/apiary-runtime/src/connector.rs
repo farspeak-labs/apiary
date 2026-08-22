@@ -77,6 +77,10 @@ pub fn bind_connectors_in(
             agent_dir: dir.to_path_buf(),
             manifest: manifest.clone(),
         }));
+        out.push(Box::new(crate::proposal::ProposeAgent {
+            agent_dir: dir.to_path_buf(),
+            npub: manifest.identity.npub.clone(),
+        }));
     }
     for entry in &manifest.connectors {
         match entry.kind.as_str() {
