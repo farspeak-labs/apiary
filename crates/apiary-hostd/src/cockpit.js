@@ -1038,9 +1038,34 @@ document.getElementById('k-go').onclick = async () => {
 
 // ------------------------------------------------------------ roster
 
+// Unapproved changes used to be visible only inside an agent's
+// Configuration tab, so an amendment could sit there for days without
+// anyone knowing it was waiting. Approval is the governor's whole job;
+// it belongs where the governor always looks.
+function updateRatifyChip() {
+  const chip = document.getElementById('c-ratify');
+  if (!chip) return;
+  const waiting = (agents || []).filter(a => !a.ratified && !a.archived);
+  chip.hidden = waiting.length === 0;
+  if (!waiting.length) return;
+  chip.textContent = waiting.length === 1
+    ? `${waiting[0].name || 'An agent'} needs approval`
+    : `${waiting.length} agents need approval`;
+  chip.title = 'Waiting for your approval: ' + waiting.map(a => a.name || shortNostrId(a.npub)).join(', ')
+    + ' — nothing runs until you approve it.';
+  chip.onclick = () => {
+    // Land on the one that has been waiting, in the tab that approves it.
+    const target = waiting.find(a => a.npub === sel) || waiting[0];
+    sel = target.npub;
+    hostView = null;
+    openTab('manifest');
+  };
+}
+
 async function loadRoster() {
   const d = await j('/api/agents');
   agents = d.agents || [];
+  updateRatifyChip();
   const root = document.getElementById('roster');
   root.replaceChildren();
   const running = new Set((hostStatus.listeners || []).filter(l => l.running).map(l => l.npub));

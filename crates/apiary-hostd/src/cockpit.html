@@ -28,6 +28,7 @@
   button.chip:hover { color:var(--text); border-color:var(--amber-soft); background:var(--panel); }
   .chip.ok { color:var(--ok); border-color:#4c6840; }
   .chip.bad { color:var(--bad); border-color:#78483e; }
+  .chip.warn { color:var(--amber); border-color:var(--amber-soft); }
   .host-menu { position:relative; }
   .host-menu > summary { list-style:none; color:var(--dim); border:1px solid var(--line); border-radius:7px; padding:7px 11px; cursor:pointer; font-size:13px; transition:background-color .18s ease,border-color .18s ease,color .18s ease,box-shadow .18s ease; }
   .host-menu > summary::-webkit-details-marker { display:none; }
@@ -260,6 +261,7 @@
   <span class="header-spacer"></span>
   <div class="header-actions">
     <button class="chip" id="c-model" title="model provider status">Model</button>
+    <button class="chip warn" id="c-ratify" title="agents with changes waiting for your approval" hidden></button>
     <button class="chip bad" id="c-lock" title="workspace lock state">Checking workspace…</button>
     <button class="chip" id="signout" title="revoke this browser session" hidden>Sign out</button>
     <details class="host-menu">
