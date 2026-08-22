@@ -5461,6 +5461,39 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
                 apiary_runtime::index::schedule_refresh(manifest, dir.clone());
             }
         }
+        // Inert MCP connectors (granted, no tools ticked) are legal but
+        // surprising — keep a note on the agent card until they're fixed.
+        if let Some(m) = manifest.as_ref() {
+            let inert: Vec<String> = m
+                .connectors
+                .iter()
+                .filter(|c| c.grants_no_tools())
+                .map(|c| {
+                    c.caps
+                        .get("library_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("mcp")
+                        .to_string()
+                })
+                .collect();
+            let mut notes = state
+                .supervisor_notes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let key = format!("{npub}:inert-connectors");
+            if inert.is_empty() {
+                notes.remove(&key);
+            } else {
+                notes.insert(
+                    key,
+                    format!(
+                        "connector {} grants no tools yet — Connectors tab → \
+                         DISCOVER TOOLS → tick what it may use → APPLY, then ratify",
+                        inert.join(", ")
+                    ),
+                );
+            }
+        }
         let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
         let presence = map.entry(npub.clone()).or_default();
         presence

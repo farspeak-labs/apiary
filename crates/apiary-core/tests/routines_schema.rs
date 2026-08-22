@@ -59,7 +59,7 @@ fn routines_validate_shape_and_targets() {
 }
 
 #[test]
-fn mcp_connector_without_allowlist_is_invalid() {
+fn mcp_connector_without_allowlist_is_valid_but_inert() {
     let m = |caps: &str| {
         Manifest::from_yaml(&format!(
             r#"
@@ -83,18 +83,24 @@ governance:
 "#
         ))
     };
-    let bare = m("      transport: stdio\n      command: npx\n");
-    assert!(bare.is_err(), "no allowlist must not validate");
+    // A fresh grant (or an OAuth re-connect, which re-grants) copies the
+    // library entry, which has no allowlist yet — that must VALIDATE, or
+    // granting an MCP connector is impossible. It just binds no tools.
+    let bare = m("      transport: stdio\n      command: npx\n").unwrap();
     assert!(
-        bare.unwrap_err().to_string().contains("DISCOVER TOOLS"),
-        "error names the fix"
+        bare.connectors[0].grants_no_tools(),
+        "no allowlist = inert, and detectably so"
     );
+    let with_tools =
+        m("      transport: stdio\n      command: npx\n      allowed_tools: [read_file]\n")
+            .unwrap();
+    assert!(!with_tools.connectors[0].grants_no_tools());
+    let with_access = m("      transport: stdio\n      command: npx\n      tool_access:\n        read_file: read-only\n").unwrap();
+    assert!(!with_access.connectors[0].grants_no_tools());
+    let empty_list =
+        m("      transport: stdio\n      command: npx\n      allowed_tools: []\n").unwrap();
     assert!(
-        m("      transport: stdio\n      command: npx\n      allowed_tools: [read_file]\n").is_ok()
-    );
-    assert!(m("      transport: stdio\n      command: npx\n      tool_access:\n        read_file: read-only\n").is_ok());
-    assert!(
-        m("      transport: stdio\n      command: npx\n      allowed_tools: []\n").is_err(),
+        empty_list.connectors[0].grants_no_tools(),
         "empty list is no allowlist"
     );
 }

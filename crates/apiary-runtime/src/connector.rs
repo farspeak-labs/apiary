@@ -331,11 +331,10 @@ fn bind_mcp(
         allowed = tool_access.keys().cloned().collect();
     }
     if allowed.is_empty() {
-        return Err(crate::Error::Provider(
-            "mcp connector requires caps.allowed_tools or caps.tool_access (an explicit \
-             allowlist; [\"*\"] grants every tool the server offers — say so deliberately)"
-                .into(),
-        ));
+        // Freshly granted, nothing ticked yet: inert, not broken. Binding
+        // zero tools keeps the agent answering while the governor finishes
+        // DISCOVER → APPLY; the host supervisor surfaces the gap loudly.
+        return Ok(Vec::new());
     }
     let read_only = match cap_str("access").as_deref() {
         Some("read-only") => true,

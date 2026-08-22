@@ -541,6 +541,30 @@ pub struct Connector {
     pub caps: BTreeMap<String, serde_json::Value>,
 }
 
+impl Connector {
+    /// True for an MCP connector whose allowlist is empty: freshly granted
+    /// (the library entry carries no allowlist) and not yet configured.
+    /// Valid but inert — it binds zero tools until tools are ticked.
+    pub fn grants_no_tools(&self) -> bool {
+        if self.kind != "mcp" {
+            return false;
+        }
+        let has_allowed = self
+            .caps
+            .get("allowed_tools")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        let has_access = self
+            .caps
+            .get("tool_access")
+            .and_then(|v| v.as_object())
+            .map(|o| !o.is_empty())
+            .unwrap_or(false);
+        !has_allowed && !has_access
+    }
+}
+
 /// Memory is three stores with different sync/growth/privacy (SPEC §9).
 /// The working set is ephemeral and deliberately absent from the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -919,32 +943,12 @@ impl Manifest {
                 }
             }
         }
-        // MCP connectors must carry their allowlist IN THE MANIFEST — the
-        // bind also enforces this, but a run-time refusal answers nobody;
-        // a validation error lands in the governor's face at save/ratify.
-        for c in self.connectors.iter().filter(|c| c.kind == "mcp") {
-            let has_allowed = c
-                .caps
-                .get("allowed_tools")
-                .and_then(|v| v.as_array())
-                .map(|a| !a.is_empty())
-                .unwrap_or(false);
-            let has_access = c
-                .caps
-                .get("tool_access")
-                .and_then(|v| v.as_object())
-                .map(|o| !o.is_empty())
-                .unwrap_or(false);
-            if !has_allowed && !has_access {
-                return Err(crate::Error::Manifest(
-                    "an mcp connector has no tool allowlist (caps.allowed_tools or \
-                     caps.tool_access). Fix: the agent's Connectors tab → DISCOVER TOOLS → \
-                     tick what it may use → APPLY, then ratify. [\"*\"] allows every tool — \
-                     say so deliberately."
-                        .into(),
-                ));
-            }
-        }
+        // An MCP connector with no allowlist is VALID but INERT: it binds
+        // zero tools. Making it a validation error created a catch-22 —
+        // a fresh grant (or an OAuth re-connect, which re-grants) copies
+        // the library entry, and the allowlist can only be added to the
+        // manifest AFTER the grant exists. The host surfaces inert
+        // connectors loudly instead (see Connector::grants_no_tools).
         // Routines: one schedule spelling, tz where it matters, valid
         // delivery targets, unique names.
         let mut rnames = std::collections::BTreeSet::new();
