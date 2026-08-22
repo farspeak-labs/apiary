@@ -1501,11 +1501,21 @@ pub async fn spend_status(
     let budget = apiary_runtime::spend::tokens_per_day(&manifest.governance.budgets)
         .ok()
         .flatten();
+    let proactive_budget =
+        apiary_runtime::spend::proactive_tokens_per_day(&manifest.governance.budgets)
+            .ok()
+            .flatten();
     let day = apiary_runtime::spend::SpendLedger::open(&dir).today();
     match day {
         Ok(d) => {
             let used = d.input_tokens + d.output_tokens;
             let reserved: u64 = d.reservations.iter().map(|r| r.amount).sum();
+            let proactive_reserved: u64 = d
+                .reservations
+                .iter()
+                .filter(|r| r.proactive)
+                .map(|r| r.amount)
+                .sum();
             Json(json!({
                 "ok": true,
                 "npub": npub,
@@ -1516,6 +1526,12 @@ pub async fn spend_status(
                 "reserved": reserved,
                 "budget_tokens_per_day": budget,
                 "remaining": budget.map(|b| b.saturating_sub(used + reserved)),
+                // The proactive sub-lane: part of `used`, not additional to it.
+                "proactive_used": d.proactive_tokens,
+                "proactive_reserved": proactive_reserved,
+                "budget_proactive_tokens_per_day": proactive_budget,
+                "proactive_remaining": proactive_budget
+                    .map(|b| b.saturating_sub(d.proactive_tokens + proactive_reserved)),
             }))
             .into_response()
         }

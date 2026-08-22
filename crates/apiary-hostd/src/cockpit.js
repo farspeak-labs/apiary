@@ -1886,6 +1886,18 @@ async function renderOverview(c) {
     if (used / spend.budget_tokens_per_day > .85) fill.className = 'hot';
     bar.append(fill); current.append(bar, help(`${Number(used).toLocaleString()} of ${Number(spend.budget_tokens_per_day).toLocaleString()} daily tokens used or reserved.`));
   }
+  if (spend.ok) {
+    const lane = spend.budget_proactive_tokens_per_day;
+    if (lane) {
+      const spent = spend.proactive_used + spend.proactive_reserved;
+      current.append(kv('Acting unasked',
+        `${Number(spent).toLocaleString()} of ${Number(lane).toLocaleString()} tokens today`
+        + (spend.proactive_remaining === 0 ? ' · spent — proactive work paused until tomorrow' : '')),
+        help('Watches and standing intentions draw on this allowance, which is part of the daily budget rather than additional to it. When it runs out, the agent stops acting on its own but still answers when spoken to.'));
+    } else if ((agents.find(a => a.npub === sel) || {}).proactive) {
+      current.append(kv('Acting unasked', 'No allowance — proactive work cannot run'));
+    }
+  }
   c.append(current);
 
   const advanced = el('details', 'section technical');

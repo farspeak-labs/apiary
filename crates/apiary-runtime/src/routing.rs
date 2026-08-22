@@ -32,6 +32,10 @@ pub struct TaskContext {
     pub lightweight: bool,
     /// Test exactly one route rather than masking it with failover.
     pub disable_fallback: bool,
+    /// Which allowance this run spends. Proactive runs (watches, standing
+    /// intentions) draw on the proactive sub-lane; everything a person or
+    /// a ratified schedule asked for stays responsive.
+    pub lane: crate::spend::Lane,
 }
 
 fn rule_matches(rule: &RoutingRule, ctx: &TaskContext) -> bool {

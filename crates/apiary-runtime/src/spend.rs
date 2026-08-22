@@ -26,6 +26,11 @@ pub struct DaySpend {
     pub output_tokens: u64,
     #[serde(default)]
     pub reservations: Vec<ReservationRecord>,
+    /// Of today's tokens, how many were spent proactively (watches,
+    /// intentions). Counted in the totals above as well — the proactive
+    /// allowance is a sub-lane, never an addition.
+    #[serde(default)]
+    pub proactive_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,11 +38,28 @@ pub struct ReservationRecord {
     pub id: u64,
     pub amount: u64,
     pub at: u64,
+    /// Drawn against the proactive sub-lane (default: responsive work).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proactive: bool,
+}
+
+/// Which allowance a run draws on.
+///
+/// Proactive work — a watch firing, an intention deliberating — spends
+/// tokens nobody asked for, so it draws on its own allowance AND on the
+/// daily one. Exhausting the proactive lane stops proactive work for the
+/// day while leaving the agent fully able to answer a person: the agent
+/// you can still talk to is the one that matters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Lane {
+    #[default]
+    Responsive,
+    Proactive,
 }
 
 /// A claim on today's remaining capacity. Settle it with actual usage (or
 /// zero on failure); unsettled reservations expire after the TTL.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Reservation {
     pub id: u64,
     pub amount: u64,
@@ -224,16 +246,26 @@ impl SpendLedger {
         cap: Option<u64>,
         per_run: Option<u64>,
     ) -> Result<Reservation, crate::Error> {
+        self.reserve_in_lane(cap, per_run, Lane::Responsive, None)
+    }
+
+    /// Reserve in a specific lane. A proactive claim must fit BOTH the
+    /// proactive allowance and the daily cap, and settles against both.
+    /// No proactive allowance means no proactive work: absent is zero.
+    pub fn reserve_in_lane(
+        &self,
+        cap: Option<u64>,
+        per_run: Option<u64>,
+        lane: Lane,
+        proactive_cap: Option<u64>,
+    ) -> Result<Reservation, crate::Error> {
+        let proactive = lane == Lane::Proactive;
         self.with_locked(|s| {
             let used = s.input_tokens + s.output_tokens;
             let reserved: u64 = s.reservations.iter().map(|r| r.amount).sum();
-            let remaining = match cap {
+            let mut remaining = match cap {
                 Some(c) => c.saturating_sub(used + reserved),
                 None => MAX_RESERVATION,
-            };
-            let remaining = match per_run {
-                Some(p) => remaining.min(p.max(1)),
-                None => remaining,
             };
             if remaining == 0 {
                 return Err(crate::Error::Budget(format!(
@@ -242,12 +274,45 @@ impl SpendLedger {
                     used, reserved, cap
                 )));
             }
+            if proactive {
+                let allowance = proactive_cap.unwrap_or(0);
+                if allowance == 0 {
+                    return Err(crate::Error::Budget(
+                        "this agent has no proactive allowance — set \
+                         governance.budgets.proactive_tokens_per_day and ratify it. \
+                         Acting unasked is a grant, not a default."
+                            .into(),
+                    ));
+                }
+                let proactive_reserved: u64 = s
+                    .reservations
+                    .iter()
+                    .filter(|r| r.proactive)
+                    .map(|r| r.amount)
+                    .sum();
+                let lane_remaining =
+                    allowance.saturating_sub(s.proactive_tokens + proactive_reserved);
+                if lane_remaining == 0 {
+                    return Err(crate::Error::Budget(format!(
+                        "proactive allowance spent for today ({} used + {} reserved / {} \
+                         allowed). Watches and intentions stop until tomorrow; this agent \
+                         still answers when spoken to.",
+                        s.proactive_tokens, proactive_reserved, allowance
+                    )));
+                }
+                remaining = remaining.min(lane_remaining);
+            }
+            let remaining = match per_run {
+                Some(p) => remaining.min(p.max(1)),
+                None => remaining,
+            };
             let amount = remaining.min(MAX_RESERVATION);
             let id = now_secs() ^ (amount << 20) ^ s.reservations.len() as u64;
             s.reservations.push(ReservationRecord {
                 id,
                 amount,
                 at: now_secs(),
+                proactive,
             });
             Ok(Reservation { id, amount })
         })
@@ -266,14 +331,24 @@ impl SpendLedger {
     ) -> Result<(DaySpend, bool), crate::Error> {
         let overran = input_tokens + output_tokens > reservation.amount;
         let day = self.with_locked(move |s| {
+            // The lane comes from the reservation record, not the caller:
+            // whoever claimed proactively settles proactively.
+            let was_proactive = s
+                .reservations
+                .iter()
+                .any(|r| r.id == reservation.id && r.proactive);
             s.reservations.retain(|r| r.id != reservation.id);
             s.input_tokens += input_tokens;
             s.output_tokens += output_tokens;
+            if was_proactive {
+                s.proactive_tokens += input_tokens + output_tokens;
+            }
             Ok(DaySpend {
                 date: s.date.clone(),
                 input_tokens: s.input_tokens,
                 output_tokens: s.output_tokens,
                 reservations: s.reservations.clone(),
+                proactive_tokens: s.proactive_tokens,
             })
         })?;
         Ok((day, overran))
@@ -293,6 +368,21 @@ pub fn tokens_per_day(
         Some(v) => v.as_u64().map(Some).ok_or_else(|| {
             crate::Error::Budget(format!(
                 "governance.budgets tokens_per_day must be a non-negative integer, got {v}"
+            ))
+        }),
+    }
+}
+
+/// The proactive sub-lane: what an agent may spend acting unasked.
+/// Absent means zero — proactivity is granted, never assumed.
+pub fn proactive_tokens_per_day(
+    budgets: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<Option<u64>, crate::Error> {
+    match budgets.get("proactive_tokens_per_day") {
+        None => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            crate::Error::Budget(format!(
+                "governance.budgets proactive_tokens_per_day must be a non-negative integer, got {v}"
             ))
         }),
     }
@@ -361,5 +451,62 @@ mod tests {
         let d = utc_date_today();
         assert_eq!(d.len(), 10);
         assert!(d.starts_with("20"));
+    }
+
+    #[test]
+    fn proactive_work_needs_an_explicit_allowance() {
+        let (l, dir) = ledger("proactive-optin");
+        // No allowance configured, and an explicit zero: both refuse, and
+        // the refusal names the grant a human has to make.
+        for allowance in [None, Some(0)] {
+            let refused = l
+                .reserve_in_lane(Some(10_000), None, Lane::Proactive, allowance)
+                .expect_err("proactivity is granted, never assumed");
+            assert!(
+                refused.to_string().contains("proactive_tokens_per_day"),
+                "{refused}"
+            );
+        }
+        // Responsive work is unaffected by the missing allowance.
+        assert!(l.reserve(Some(10_000)).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn proactive_lane_is_a_sub_lane_not_an_addition() {
+        let (l, dir) = ledger("proactive-sublane");
+        let day_cap = Some(1_000);
+        let lane_cap = Some(400);
+        // Spend the whole proactive allowance.
+        let r = l
+            .reserve_in_lane(day_cap, Some(400), Lane::Proactive, lane_cap)
+            .unwrap();
+        assert_eq!(r.amount, 400);
+        let (day, _) = l.settle(r, 300, 100).unwrap();
+        // It counted against BOTH ledgers — proactivity never raises the total.
+        assert_eq!(day.proactive_tokens, 400);
+        assert_eq!(day.input_tokens + day.output_tokens, 400);
+        // Lane exhausted: proactive work stops...
+        let refused = l
+            .reserve_in_lane(day_cap, None, Lane::Proactive, lane_cap)
+            .expect_err("lane is spent");
+        assert!(refused.to_string().contains("still answers"), "{refused}");
+        // ...while the agent can still be spoken to, on the day's remainder.
+        let responsive = l.reserve_up_to(day_cap, None).unwrap();
+        assert_eq!(responsive.amount, 600);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_exhausted_day_stops_proactive_work_too() {
+        let (l, dir) = ledger("proactive-daycap");
+        // A generous lane cannot outlive the daily cap that contains it.
+        let r = l.reserve_up_to(Some(500), Some(500)).unwrap();
+        l.settle(r, 500, 0).unwrap();
+        let refused = l
+            .reserve_in_lane(Some(500), None, Lane::Proactive, Some(100_000))
+            .expect_err("the daily cap bounds every lane");
+        assert!(refused.to_string().contains("daily token budget"), "{refused}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -131,7 +131,10 @@ pub fn run_task_observed(
     //    provider). Refusals are part of the track record too.
     let budget_started = std::time::Instant::now();
     let cap = tokens_per_day(&manifest.governance.budgets)?;
-    let reservation = match ledger.reserve_up_to(cap, ctx.tokens_per_run) {
+    let proactive_cap =
+        crate::spend::proactive_tokens_per_day(&manifest.governance.budgets).unwrap_or(None);
+    let reservation = match ledger.reserve_in_lane(cap, ctx.tokens_per_run, ctx.lane, proactive_cap)
+    {
         Ok(r) => r,
         Err(e) => {
             log.append(
@@ -936,6 +939,9 @@ pub fn run_acp_task(
         }
         HarnessMetering::Estimated => {
             let estimate = grant.estimated_tokens_per_run.unwrap_or(0);
+            // Responsive by construction: a foreign harness session is always
+            // something a person or a ratified schedule asked for. Proactive
+            // work runs through the native loop.
             let reservation = ledger.reserve_up_to(cap, Some(estimate))?;
             if reservation.amount < estimate {
                 ledger.settle(reservation, 0, 0)?;
