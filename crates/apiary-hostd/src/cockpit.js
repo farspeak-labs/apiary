@@ -1854,7 +1854,7 @@ async function renderOverview(c) {
   for (const [seconds, label] of [[3600, '1 hour'], [86400, '24 hours'], [604800, '7 days'], [2592000, '30 days'], [7776000, '90 days']]) {
     const option = el('option', null, label); option.value = String(seconds); if (seconds === 86400) option.selected = true; ttl.append(option);
   }
-  const tokenLabel = el('input'); tokenLabel.placeholder = 'e.g. Scout manager loop'; tokenLabel.maxLength = 80;
+  const tokenLabel = el('input'); tokenLabel.placeholder = 'e.g. nightly manager loop'; tokenLabel.maxLength = 80;
   const createToken = el('button', 'btn', 'Create agent access token');
   const tokenStatus = el('span', 'meta', '');
   const tokenOutput = el('textarea', 'address-list'); tokenOutput.rows = 4; tokenOutput.readOnly = true;

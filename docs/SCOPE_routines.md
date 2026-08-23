@@ -61,7 +61,7 @@ Every fire writes a `routine.run` entry (self tier) with `{routine, scheduled_fo
 
 ## The companion as a delivery target
 
-`deliver: [{companion: true}]` means: when this fires, the human's apiary-voice should *say it*. Mechanism: hostd gains an SSE `GET /api/events` (governor/operator auth) that broadcasts host-level events — `routine.delivered`, later `mention.answered` etc. — and apiary-voice subscribes while running, speaking `companion` deliveries and showing them in the HUD (thin bar: "scout · morning brief ▸"). If no companion is connected, the delivery is logged as `undelivered: no companion` and, if the routine also names a chat, that copy still goes. This is the "morning brief spoken at 8:00 while you make coffee" case, and it costs one small endpoint. Not a push notification system; a live subscription.
+`deliver: [{companion: true}]` means: when this fires, the human's apiary-voice should *say it*. Mechanism: hostd gains an SSE `GET /api/events` (governor/operator auth) that broadcasts host-level events — `routine.delivered`, later `mention.answered` etc. — and apiary-voice subscribes while running, speaking `companion` deliveries and showing them in the HUD (thin bar: "agent · morning brief ▸"). If no companion is connected, the delivery is logged as `undelivered: no companion` and, if the routine also names a chat, that copy still goes. This is the "morning brief spoken at 8:00 while you make coffee" case, and it costs one small endpoint. Not a push notification system; a live subscription.
 
 ## Non-goals, stated so they stay out
 
@@ -79,4 +79,4 @@ Every fire writes a `routine.run` entry (self tier) with `{routine, scheduled_fo
 4. `GET /api/events` + apiary-voice subscription + `companion` delivery.
 5. Agent-drafted proposals (`manifest.proposed.yaml` + cockpit banner) — reuse for any agent-authored amendment.
 
-Live proof: scout's `morning-brief` at a near-future minute, delivered to Telegram as af_heart voice and spoken by the companion, both in the signed log; a deliberately overlapping second routine skipped and logged; a paused routine not firing; the same agent imported into a second home firing nowhere while the first holds the lease.
+Live proof: an agent's `morning-brief` at a near-future minute, delivered to Telegram as af_heart voice and spoken by the companion, both in the signed log; a deliberately overlapping second routine skipped and logged; a paused routine not firing; the same agent imported into a second home firing nowhere while the first holds the lease.

@@ -471,7 +471,7 @@ mod tests {
         TelegramAdapter {
             client: reqwest::blocking::Client::new(),
             token: "t".into(),
-            bot_username: "scout_bot".into(),
+            bot_username: "helper_bot".into(),
             allowed_chats: vec!["100".into()],
             offset: 0,
         }
@@ -482,10 +482,10 @@ mod tests {
         let a = adapter();
         assert!(a.triggers(&json!({"chat": {"type": "private"}, "text": "hello"})));
         assert!(!a.triggers(&json!({"chat": {"type": "group"}, "text": "hello"})));
-        assert!(a.triggers(&json!({"chat": {"type": "group"}, "text": "hey @Scout_Bot help"})));
+        assert!(a.triggers(&json!({"chat": {"type": "group"}, "text": "hey @Helper_Bot help"})));
         assert!(a.triggers(&json!({
             "chat": {"type": "group"}, "text": "yes",
-            "reply_to_message": {"from": {"username": "scout_bot"}}
+            "reply_to_message": {"from": {"username": "helper_bot"}}
         })));
     }
 
@@ -497,7 +497,7 @@ mod tests {
         assert!(!a.triggers(&json!({"chat": {"type": "group"}, "photo": [{}]})));
         assert!(a.triggers(&json!({
             "chat": {"type": "group"}, "photo": [{}],
-            "caption": "what is this @scout_bot?"
+            "caption": "what is this @helper_bot?"
         })));
     }
 
@@ -509,7 +509,7 @@ mod tests {
         assert!(!a.triggers(&json!({"chat": {"type": "group"}, "voice": {"file_id": "v"}})));
         assert!(a.triggers(&json!({
             "chat": {"type": "group"}, "voice": {"file_id": "v"},
-            "caption": "@scout_bot listen to this"
+            "caption": "@helper_bot listen to this"
         })));
     }
 

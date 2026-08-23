@@ -143,7 +143,7 @@ cargo build
 export APIARY_PASSPHRASE='choose-a-passphrase'
 
 # Create and ratify an agent.
-target/debug/apiary agent new --name scout --suspend-key npub1…
+target/debug/apiary agent new --name researcher --suspend-key npub1…
 target/debug/apiary agent ratify <agent-npub> --as <manager-npub>
 
 # Run a governed task and verify its signed history.
