@@ -26,6 +26,11 @@ fn subscription_since(now: u64) -> u64 {
     now.saturating_sub(REPLAY_OVERLAP_SECS)
 }
 
+/// How long a subscription may go completely silent before the listener
+/// stops trusting it. Long enough that a genuinely quiet channel is not
+/// churned, short enough that a lapse costs minutes rather than a day.
+const RESUBSCRIBE_AFTER_SILENCE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 #[derive(Default)]
 struct RecentEventIds {
     ids: std::collections::VecDeque<String>,
@@ -98,6 +103,10 @@ pub struct BuzzSession<'a> {
     /// auth) was waiting for its own reply — drained by `next_mention` so
     /// mentions received mid-reply are not lost.
     pending: Vec<Value>,
+    /// When the relay last showed signs of life. A subscription can lapse
+    /// while the socket stays open; without this the listener goes deaf and
+    /// nothing looks wrong.
+    last_traffic: std::time::Instant,
     /// Set once the live mention subscription is active.
     listening: bool,
 }
@@ -117,6 +126,7 @@ impl<'a> BuzzSession<'a> {
             agent,
             authed: false,
             pending: Vec::new(),
+            last_traffic: std::time::Instant::now(),
             listening: false,
         })
     }
@@ -450,11 +460,25 @@ impl<'a> BuzzSession<'a> {
                         self.socket
                             .send(Message::Ping(Vec::new().into()))
                             .map_err(|e| crate::Error::Provider(format!("keepalive ping: {e}")))?;
+                        // A subscription can also lapse without a CLOSED, and
+                        // a pong keeps answering either way. Re-REQ after a
+                        // long silence: replay is bounded by `since` and the
+                        // adapter dedupes ids, so the cost of being wrong is
+                        // near zero — far below going deaf for a day.
+                        if self.last_traffic.elapsed() > RESUBSCRIBE_AFTER_SILENCE {
+                            eprintln!(
+                                "no relay traffic for {}m — resubscribing",
+                                RESUBSCRIBE_AFTER_SILENCE.as_secs() / 60
+                            );
+                            self.subscribe_channels(channels)?;
+                            self.last_traffic = std::time::Instant::now();
+                        }
                         return Ok(None);
                     }
                     Err(e) => return Err(e),
                 }
             };
+            self.last_traffic = std::time::Instant::now();
             match v.get(0).and_then(|t| t.as_str()) {
                 Some("AUTH") => {
                     let challenge = v
@@ -467,11 +491,16 @@ impl<'a> BuzzSession<'a> {
                     self.subscribe_channels(channels)?;
                 }
                 Some("CLOSED") => {
+                    // The relay dropped this subscription. Logging it and
+                    // carrying on left the agent listening to a socket that
+                    // would never deliver again — awake, connected, deaf.
                     eprintln!(
-                        "subscription closed by relay: {} — {}",
+                        "subscription closed by relay: {} — {} · resubscribing",
                         v.get(1).and_then(|s| s.as_str()).unwrap_or("?"),
                         v.get(2).and_then(|m| m.as_str()).unwrap_or("")
                     );
+                    self.subscribe_channels(channels)?;
+                    self.last_traffic = std::time::Instant::now();
                 }
                 Some("EVENT")
                     if v.get(1)
