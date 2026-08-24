@@ -8,6 +8,7 @@
 pub mod acp;
 pub mod buzz;
 pub mod connector;
+pub mod errands;
 pub mod huddle;
 pub mod index;
 pub mod inference;
