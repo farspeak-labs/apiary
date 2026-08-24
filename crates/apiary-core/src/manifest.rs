@@ -584,6 +584,17 @@ pub struct Memory {
     /// self NIP-44-wrapped, local never).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub log_relays: Vec<String>,
+    /// Keep what was actually said in conversations, not merely that they
+    /// happened.
+    ///
+    /// Off by default, and deliberately so: the episodic log is signed,
+    /// portable, and sometimes published, so other people's words do not
+    /// belong in it unless a governor decided they should. Turning it on
+    /// gives the agent durable memory that survives the relay's retention,
+    /// travels with it between hosts, and — with an `embed` slot — becomes
+    /// searchable recall rather than just the last few messages.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remember_conversations: bool,
     /// Markdown knowledge folders (Obsidian vaults, KB repos, plain note
     /// dirs) chunked into the semantic index — ambient recall alongside
     /// the agent's own log memories. Host-local paths: vault contents are

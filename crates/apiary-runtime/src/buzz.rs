@@ -428,6 +428,62 @@ impl<'a> BuzzSession<'a> {
         Ok(())
     }
 
+
+    /// Read back the last `limit` messages in a channel, oldest first.
+    ///
+    /// A separate short-lived subscription on the same authenticated socket:
+    /// REQ with a limit, collect until EOSE, then CLOSE. Events that arrive
+    /// for the listening subscription meanwhile are buffered rather than
+    /// dropped — the caller is mid-mention and must not lose the next one.
+    pub fn recent_messages(
+        &mut self,
+        channel: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, u64)>, crate::Error> {
+        const SUB: &str = "apiary-history";
+        self.send(json!([
+            "REQ",
+            SUB,
+            {"kinds": [KIND_STREAM_MESSAGE], "#h": [channel], "limit": limit}
+        ]))?;
+        let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            let v = match self.recv() {
+                Ok(v) => v,
+                // A quiet socket means the relay has nothing more to say.
+                Err(crate::Error::Provider(msg)) if msg == "recv-timeout" => break,
+                Err(e) => return Err(e),
+            };
+            match v.get(0).and_then(|t| t.as_str()) {
+                Some("EOSE") if v.get(1).and_then(|s| s.as_str()) == Some(SUB) => break,
+                Some("EVENT") if v.get(1).and_then(|s| s.as_str()) == Some(SUB) => {
+                    let Some(raw) = v.get(2) else { continue };
+                    let Ok(event) = Event::from_json(raw.to_string()) else {
+                        continue;
+                    };
+                    if event.verify().is_err() {
+                        continue;
+                    }
+                    out.push((
+                        event.pubkey.to_hex(),
+                        event.content.clone(),
+                        event.created_at.as_secs(),
+                    ));
+                }
+                // Anything for the listening subscription belongs to the
+                // mention loop; hold it rather than swallow it.
+                _ => self.pending.push(v),
+            }
+        }
+        let _ = self.send(json!(["CLOSE", SUB]));
+        out.sort_by_key(|(_, _, at)| *at);
+        Ok(out)
+    }
+
     /// Block until a kind-9 message MENTIONS this agent (p tag, or the
     /// literal `@name` trigger in the text) — or until `stop` flips, which
     /// returns Ok(None). Subscribes on first call with a short replay overlap;
@@ -621,6 +677,23 @@ impl<'a> BuzzAdapter<'a> {
 impl crate::presence::ChannelAdapter for BuzzAdapter<'_> {
     fn kind(&self) -> &'static str {
         "buzz"
+    }
+
+    fn recent_context(&mut self, channel: &str, limit: usize) -> Vec<(String, String)> {
+        let me = self.session.agent.pubkey().to_hex();
+        self.session
+            .recent_messages(channel, limit)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(author, text, _)| {
+                let who = if author == me {
+                    "you".to_string()
+                } else {
+                    format!("{}…", &author[..author.len().min(8)])
+                };
+                (who, text)
+            })
+            .collect()
     }
 
     fn describe(&self) -> String {
