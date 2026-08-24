@@ -88,6 +88,11 @@ pending → running → delivered
 errand. The next reply from the person who asked resumes it, carrying the
 question and their answer — it does not start a fresh unrelated run.
 
+Questions are also *cheaper* than the alternative. An agent that asks which
+product line you meant spends one short exchange; an agent that guesses
+spends a full draft and then spends another one redoing it. Focus buys more
+than it costs.
+
 The bounds that keep this from becoming an unmanaged conversation:
 
 - **One open question at a time** per errand.
@@ -122,7 +127,16 @@ That mechanism already half exists. `propose_amendment`, `propose_routine`
 and `propose_agent` are exactly "the agent asks for a change to its own
 shape, and a human approves." Self-adaptation is not a new subsystem so much
 as an agent that reflects on its own track record and uses the tools it
-already has. What it would need:
+already has — the agent works *with* the governor to change itself, rather
+than either drifting on its own or staying frozen.
+
+That makes one thing load-bearing: **a per-agent record of what changed and
+why.** Not a diff buried in git, but a readable history — "gained the vault
+write capability on the 14th, at its own request, because three drafts in a
+row died on not being able to save." An agent that changes shape over months
+without a legible account of why is one nobody can reason about.
+
+What it would need:
 
 - Something to reflect **on** — the signed log already holds every run, its
   outcome, and its cost.
@@ -133,3 +147,18 @@ already has. What it would need:
   month of being asked the same unanswerable question is a colleague.
 
 That is a separate scope. It is named here so the pieces are built to fit it.
+
+## The question this raised: agent-to-agent communication
+
+Extending an errand's budget, a steward keeping an eye on a colleague's
+work, one agent assigning another its tools — all of these want agents to be able to
+address each other directly, and right now they cannot. They can only reach
+each other the way people do: by posting in a channel both are present in.
+
+That is not obviously the wrong answer. It is legible, it is audited by
+construction, and a human can read the exchange. A dedicated agent-to-agent
+layer would be faster and would also be the first channel in this system that
+no person is watching, which is exactly the kind of thing that should be
+built deliberately rather than by accident.
+
+Named here, not answered here. It deserves its own scope.
