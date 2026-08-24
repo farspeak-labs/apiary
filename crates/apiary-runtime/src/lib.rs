@@ -8,6 +8,7 @@
 pub mod acp;
 pub mod buzz;
 pub mod connector;
+pub mod huddle;
 pub mod index;
 pub mod inference;
 pub mod lease;
@@ -18,7 +19,6 @@ pub mod proposal;
 pub mod publish;
 pub mod relay;
 pub mod routines;
-pub mod watches;
 pub mod routing;
 pub mod runner;
 pub mod slack;
@@ -26,6 +26,7 @@ pub mod speak;
 pub mod spend;
 pub mod telegram;
 pub mod transcribe;
+pub mod watches;
 pub mod vault;
 
 #[derive(Debug, thiserror::Error)]

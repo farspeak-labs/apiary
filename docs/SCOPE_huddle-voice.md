@@ -3,7 +3,6 @@ Voice so far has meant the **companion app** (apiary-voice): a Mac app, a push-t
 
 A huddle is a better fit, for one reason that outweighs the rest: **Buzz and Apiary run on the same machine.** The audio path is localhost. And because Buzz has mobile, an agent in a huddle reaches you on your phone without shipping an iOS app.
 
-{++⁠We would need to allow for Apiary and Buzz to be on separate hosts but in our situation they're on the same systems++}{id="s1" by="user" at="2026-08-23T23:42:33.106Z"}
 ## What Buzz already provides
 Huddle audio lives in `buzz-relay` (`src/audio/`) — no external SFU:
 
@@ -73,6 +72,11 @@ Buzz ships its own local voice primitives (`buzz-voice`: April ASR and a local T
 ## Open questions
 - **Which agent?** The first candidate is whichever agent already has voice slots configured and a proven speak path.
   
+    
+    
 - **Does the mini have the headroom** for a resident TTS model alongside the relay, Postgres, Redis, and the roastery stack? Worth measuring before committing to a local model rather than an API.
   
+    
 - **Does apiary-voice survive?** I would keep it: it is the right shape for 1:1 desktop dictation, and it is where the streaming and barge-in logic was worked out. The huddle path is for multi-party and mobile.
+  
+  
