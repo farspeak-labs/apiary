@@ -95,8 +95,8 @@ pub fn bind_connectors_in(
     for entry in &manifest.connectors {
         match entry.kind.as_str() {
             "mcp" => out.extend(bind_mcp(entry, custody, agent, agent_dir)?),
-            "obsidian" => out.extend(bind_vault(entry, true)?),
-            "markdown-vault" => out.extend(bind_vault(entry, false)?),
+            "obsidian" => out.extend(bind_vault(entry, true, manifest.memory.knowledge_home.as_ref())?),
+            "markdown-vault" => out.extend(bind_vault(entry, false, manifest.memory.knowledge_home.as_ref())?),
             "web-search" => {
                 out.push(Box::new(bind_web_search(entry)?));
                 // A full-research grant can deliberately include the public page
@@ -1916,6 +1916,7 @@ fn run_git_bounded(root: &NamedRoot, args: &[String]) -> Result<String, crate::E
 fn bind_vault(
     entry: &apiary_core::manifest::Connector,
     obsidian: bool,
+    home: Option<&apiary_core::manifest::KnowledgeHome>,
 ) -> Result<Vec<Box<dyn Connector>>, crate::Error> {
     let vaults: Vec<(String, std::path::PathBuf)> = entry
         .caps
@@ -1968,6 +1969,17 @@ fn bind_vault(
         }),
     ];
     if write {
+        // `remember` only exists when the governor declared a destination
+        // AND that destination is one of the vaults this connector can
+        // write. No declaration, no durable memory — the agent is not left
+        // guessing where its knowledge should go.
+        if let Some(home) = home.filter(|h| vault_names.iter().any(|n| *n == h.vault)) {
+            out.push(Box::new(RememberNote {
+                kind,
+                vaults: shared.clone(),
+                home: home.clone(),
+            }));
+        }
         out.push(Box::new(VaultWrite {
             kind,
             vaults: shared,
@@ -1975,6 +1987,103 @@ fn bind_vault(
         }));
     }
     Ok(out)
+}
+
+/// `remember` — write something learned into the agent's declared knowledge
+/// home.
+///
+/// Separate from `vault_write` on purpose. Writing a file is a mechanical
+/// act; remembering is a claim that will be read later by people and by
+/// other agents, so the host decides where it lands and stamps who said it.
+/// **Attribution is not optional and the agent cannot suppress it**: without
+/// it, nobody reading the knowledge base six months from now can tell a
+/// human decision from an agent's inference.
+struct RememberNote {
+    kind: &'static str,
+    vaults: Vaults,
+    home: apiary_core::manifest::KnowledgeHome,
+}
+
+impl Connector for RememberNote {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "remember".into(),
+            description: format!(
+                "Write something you have learned into your knowledge home ({} in the {} \
+                 vault), where it survives this run and other people and agents can read \
+                 it. Use it for durable, reusable facts and decisions — not for chatter, \
+                 and not for what you merely did (that is already in your log). Your name \
+                 and the date are recorded automatically. Appends by default, so an \
+                 existing note grows rather than being overwritten.",
+                self.home
+                    .folder
+                    .as_deref()
+                    .filter(|f| !f.is_empty())
+                    .unwrap_or("the root"),
+                self.home.vault,
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "short title; the file is named from it"},
+                    "note": {"type": "string", "description": "what you learned, in markdown"},
+                    "replace": {"type": "boolean", "description": "rewrite the note instead of appending (default false)"},
+                },
+                "required": ["title", "note"],
+            }),
+        }
+    }
+
+    fn execute(
+        &self,
+        _custody: &Custody,
+        agent: &AgentHandle,
+        args: &Value,
+    ) -> Result<String, crate::Error> {
+        let title = args
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| crate::Error::Provider("title is required".into()))?;
+        let note = args
+            .get("note")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| crate::Error::Provider("note is required".into()))?;
+        let replace = args
+            .get("replace")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let root = self
+            .vaults
+            .iter()
+            .find(|(name, _)| *name == self.home.vault)
+            .map(|(_, root)| root.clone())
+            .ok_or_else(|| {
+                crate::Error::Provider(format!(
+                    "knowledge home vault '{}' is not available on this host",
+                    self.home.vault
+                ))
+            })?;
+        // The HOST picks the path from the title — the agent never chooses
+        // where its memory lands.
+        let rel = self.home.note_path(title);
+        let stamp = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
+        // Attribution the agent cannot suppress: its own key, not a name
+        // it chose for itself.
+        let who = agent.pubkey().to_bech32().unwrap_or_else(|_| agent.pubkey().to_hex());
+        let entry = format!(
+            "\n---\n_Recorded by {who} · {stamp}_\n\n### {title}\n\n{note}\n"
+        );
+        write_into_vault(&root, &rel, &entry, !replace)?;
+        Ok(format!(
+            "Remembered in {} ({}). It is attributed to you and dated; anyone with the \
+             vault can read, correct, or build on it.",
+            rel, self.kind
+        ))
+    }
 }
 
 type Vaults = std::sync::Arc<Vec<(String, std::path::PathBuf)>>;
@@ -2287,6 +2396,82 @@ impl Connector for VaultRead {
     }
 }
 
+/// Write into a vault with the full set of ordered defenses. Extracted so
+/// every path that writes into a vault gets the same ones — a second copy is
+/// a second chance to omit the symlink check.
+///
+/// Reject absolute paths and traversal LEXICALLY first, verify the deepest
+/// EXISTING ancestor canonicalizes into the jail BEFORE creating anything,
+/// re-verify the parent after creation, and refuse to write through a
+/// symlink.
+fn write_into_vault(
+    root: &std::path::Path,
+    rel: &str,
+    content: &str,
+    append: bool,
+) -> Result<bool, crate::Error> {
+    let rel_path = std::path::Path::new(rel);
+    if rel_path.is_absolute()
+        || !rel.ends_with(".md")
+        || rel_path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(crate::Error::Provider(
+            "path must be a plain vault-relative .md file (no traversal, no absolute paths)"
+                .into(),
+        ));
+    }
+    let target = root.join(rel_path);
+    let parent = target
+        .parent()
+        .ok_or_else(|| crate::Error::Provider("bad path".into()))?;
+    let mut probe = parent.to_path_buf();
+    while !probe.exists() {
+        probe = match probe.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return Err(crate::Error::Provider("bad path".into())),
+        };
+    }
+    let canon_probe = probe
+        .canonicalize()
+        .map_err(|e| crate::Error::Provider(e.to_string()))?;
+    if !canon_probe.starts_with(root) {
+        return Err(crate::Error::Provider(format!(
+            "'{rel}' escapes the vault — refused"
+        )));
+    }
+    std::fs::create_dir_all(parent).map_err(|e| crate::Error::Provider(e.to_string()))?;
+    let canon_parent = parent
+        .canonicalize()
+        .map_err(|e| crate::Error::Provider(e.to_string()))?;
+    if !canon_parent.starts_with(root) {
+        return Err(crate::Error::Provider(format!(
+            "'{rel}' escapes the vault — refused"
+        )));
+    }
+    let existed = match std::fs::symlink_metadata(&target) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(crate::Error::Provider(format!(
+                "'{rel}' is a symlink — refused"
+            )))
+        }
+        Ok(_) => true,
+        Err(_) => false,
+    };
+    use std::io::Write;
+    if append && existed {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&target)
+            .map_err(|e| crate::Error::Provider(e.to_string()))?;
+        writeln!(f, "\n{content}").map_err(|e| crate::Error::Provider(e.to_string()))?;
+    } else {
+        std::fs::write(&target, content).map_err(|e| crate::Error::Provider(e.to_string()))?;
+    }
+    Ok(append && existed)
+}
+
 struct VaultWrite {
     kind: &'static str,
     vaults: Vaults,
@@ -2326,86 +2511,15 @@ impl Connector for VaultWrite {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| crate::Error::Provider("path is required".into()))?;
-        // Ordered defenses (review finding: symlink escapes + create-
-        // before-check): reject absolute paths and traversal LEXICALLY
-        // first, verify the deepest EXISTING ancestor canonicalizes into
-        // the jail BEFORE creating anything, re-verify the parent after
-        // creation, and refuse to write through a symlink target.
-        let rel_path = std::path::Path::new(rel);
-        if rel_path.is_absolute()
-            || !rel.ends_with(".md")
-            || rel_path
-                .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-        {
-            return Err(crate::Error::Provider(
-                "path must be a plain vault-relative .md file (no traversal, no absolute paths)"
-                    .into(),
-            ));
-        }
         let content = args
             .get("content")
             .and_then(|v| v.as_str())
             .ok_or_else(|| crate::Error::Provider("content is required".into()))?;
         let append = args.get("append").and_then(|v| v.as_bool()).unwrap_or(true);
         let (name, root) = vault_root(&self.vaults, args.get("vault").and_then(|v| v.as_str()))?;
-        let target = root.join(rel_path);
-        let parent = target
-            .parent()
-            .ok_or_else(|| crate::Error::Provider("bad path".into()))?;
-        // Deepest existing ancestor must live in the jail BEFORE mkdir —
-        // a symlinked intermediate directory would otherwise carry the
-        // new directories (and the file) outside the vault.
-        let mut probe = parent.to_path_buf();
-        while !probe.exists() {
-            probe = match probe.parent() {
-                Some(p) => p.to_path_buf(),
-                None => return Err(crate::Error::Provider("bad path".into())),
-            };
-        }
-        let canon_probe = probe
-            .canonicalize()
-            .map_err(|e| crate::Error::Provider(e.to_string()))?;
-        if !canon_probe.starts_with(root) {
-            return Err(crate::Error::Provider(format!(
-                "'{rel}' escapes the vault — refused"
-            )));
-        }
-        std::fs::create_dir_all(parent).map_err(|e| crate::Error::Provider(e.to_string()))?;
-        let canon_parent = parent
-            .canonicalize()
-            .map_err(|e| crate::Error::Provider(e.to_string()))?;
-        if !canon_parent.starts_with(root) {
-            return Err(crate::Error::Provider(format!(
-                "'{rel}' escapes the vault — refused"
-            )));
-        }
-        // Never write THROUGH a symlink: an existing evil.md → /etc/…
-        // must not receive the append/overwrite.
-        let existed = match std::fs::symlink_metadata(&target) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(crate::Error::Provider(format!(
-                    "'{rel}' is a symlink — refused"
-                )))
-            }
-            Ok(_) => true,
-            Err(_) => false,
-        };
-        use std::io::Write;
-        if append && existed {
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&target)
-                .map_err(|e| crate::Error::Provider(e.to_string()))?;
-            writeln!(f, "\n{content}").map_err(|e| crate::Error::Provider(e.to_string()))?;
-        } else {
-            std::fs::write(&target, content).map_err(|e| crate::Error::Provider(e.to_string()))?;
-        }
+        let appended = write_into_vault(&root, rel, content, append)?;
         let _ = self.kind;
-        Ok(
-            json!({"vault": name, "path": rel, "written": true, "appended": append && existed})
-                .to_string(),
-        )
+        Ok(json!({"vault": name, "path": rel, "written": true, "appended": appended}).to_string())
     }
 }
 

@@ -601,6 +601,11 @@ pub struct Memory {
     /// NOT exported or published; a destination host re-indexes its own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vaults: Vec<VaultRef>,
+    /// Where durable knowledge is written (SCOPE: joint memory). Absent
+    /// means the agent has nowhere to put what it learns — it can still
+    /// read its vaults, but nothing it works out survives the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_home: Option<KnowledgeHome>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -612,6 +617,53 @@ pub struct VaultRef {
     /// "markdown" (default) or "obsidian" (frontmatter/tags/wikilinks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+}
+
+/// Where an agent's durable knowledge lives.
+///
+/// The episodic log is what this agent DID — signed, identity-bound, and
+/// never shared. This is different: what the agent LEARNS, written into a
+/// store the organization already keeps, where people can read, correct, and
+/// build on it. One place, declared, rather than knowledge scattered across
+/// whatever an agent happened to touch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeHome {
+    /// A name from `memory.vaults`. Knowledge goes where the agent was
+    /// already granted access — this names a destination, never a new grant.
+    pub vault: String,
+    /// Optional subfolder for agent-written notes. Keeping them together
+    /// makes it obvious at a glance which parts of a shared knowledge base
+    /// an agent wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+}
+
+impl KnowledgeHome {
+    /// Vault-relative path for a note titled `title`. Always lands inside
+    /// the declared folder and always ends in .md, so an agent cannot choose
+    /// to write its memory somewhere else.
+    pub fn note_path(&self, title: &str) -> String {
+        let mut slug: String = title
+            .trim()
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        while slug.contains("--") {
+            slug = slug.replace("--", "-");
+        }
+        let slug = slug.trim_matches('-').to_string();
+        let slug = if slug.is_empty() {
+            "note".to_string()
+        } else {
+            slug.chars().take(80).collect()
+        };
+        match self.folder.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+            Some(folder) => format!("{}/{slug}.md", folder.trim_matches('/')),
+            None => format!("{slug}.md"),
+        }
+    }
 }
 
 fn default_index() -> String {
@@ -1177,6 +1229,30 @@ impl Manifest {
                             r.name
                         )));
                     }
+                }
+            }
+        }
+        // Knowledge home: a destination, never a grant. It must name a vault
+        // the agent already has, and it may not point outside it.
+        if let Some(home) = &self.memory.knowledge_home {
+            if !self.memory.vaults.iter().any(|v| v.name == home.vault) {
+                return Err(crate::Error::Manifest(format!(
+                    "memory.knowledge_home names vault '{}', which this agent has not been \
+                     granted (memory.vaults). A knowledge home is a destination, not a grant.",
+                    home.vault
+                )));
+            }
+            if let Some(folder) = &home.folder {
+                let path = std::path::Path::new(folder);
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                {
+                    return Err(crate::Error::Manifest(format!(
+                        "memory.knowledge_home folder '{folder}' must be a plain relative \
+                         folder inside the vault (no traversal, no absolute paths)"
+                    )));
                 }
             }
         }

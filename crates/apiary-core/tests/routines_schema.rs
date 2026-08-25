@@ -104,3 +104,83 @@ governance:
         "empty list is no allowlist"
     );
 }
+
+/// A knowledge home names WHERE durable knowledge goes. It is a destination,
+/// never a grant: it can only point at a vault the agent already has, and it
+/// cannot point outside it.
+#[test]
+fn a_knowledge_home_is_a_destination_not_a_grant() {
+    let manifest = |memory: &str| {
+        Manifest::from_yaml(&format!(
+            r#"
+manifest_version: 1
+identity:
+  npub: npub1m8mfxnr32mlkylq9s0cj5l6vheatdu39kaze26e65ptzfr8vudgse6kgv3
+inference:
+  - name: brain
+    provider: mock
+routing:
+  default: brain
+memory:
+{memory}
+governance:
+  suspend_keys:
+    - npub1kpmddremcthyftcuua6hjkt9hekc729j78qkhfgfvv35efjz0mnsgddfeg
+"#
+        ))
+    };
+    let granted = "  log: local\n  vaults:\n    - name: TeamKB\n      path: /tmp/kb\n";
+
+    // Points at a granted vault: fine.
+    let ok = manifest(&format!(
+        "{granted}  knowledge_home:\n    vault: TeamKB\n    folder: agent-notes\n"
+    ))
+    .expect("a home in a granted vault validates");
+    let home = ok.memory.knowledge_home.expect("home present");
+    assert_eq!(home.vault, "TeamKB");
+
+    // Points at a vault it was never given: refused, and says why.
+    let error = manifest(&format!("{granted}  knowledge_home:\n    vault: SomeoneElsesKB\n"))
+        .expect_err("cannot write knowledge into a vault it has no access to");
+    assert!(error.to_string().contains("has not been granted"), "{error}");
+    assert!(error.to_string().contains("destination, not a grant"), "{error}");
+
+    // Cannot escape the vault it was pointed at.
+    for bad in ["../elsewhere", "/etc", "notes/../../escape"] {
+        let error = manifest(&format!(
+            "{granted}  knowledge_home:\n    vault: TeamKB\n    folder: \"{bad}\"\n"
+        ))
+        .expect_err("traversal must be refused");
+        assert!(error.to_string().contains("no traversal"), "{bad}: {error}");
+    }
+
+    // Absent is legal — the agent simply has nowhere durable to put things.
+    assert!(manifest(granted).unwrap().memory.knowledge_home.is_none());
+}
+
+/// The note path is chosen by the host, not the agent: always inside the
+/// declared folder, always .md, whatever title it hands over.
+#[test]
+fn the_host_decides_where_a_remembered_note_lands() {
+    use apiary_core::manifest::KnowledgeHome;
+    let home = KnowledgeHome {
+        vault: "TeamKB".into(),
+        folder: Some("agent-notes".into()),
+    };
+    assert_eq!(
+        home.note_path("Shrinkage varies by machine"),
+        "agent-notes/shrinkage-varies-by-machine.md"
+    );
+    // Titles that try to steer the path are slugified, not obeyed.
+    assert_eq!(
+        home.note_path("../../etc/passwd"),
+        "agent-notes/etc-passwd.md"
+    );
+    assert_eq!(home.note_path("  !!!  "), "agent-notes/note.md");
+    // No folder: still inside the vault, still markdown.
+    let flat = KnowledgeHome {
+        vault: "TeamKB".into(),
+        folder: None,
+    };
+    assert_eq!(flat.note_path("A Fact"), "a-fact.md");
+}
