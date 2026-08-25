@@ -258,8 +258,14 @@ pub fn run_presence(
              So never promise future work. If something genuinely needs doing on \
              a schedule, propose a routine; otherwise do what you can now and say \
              plainly what you did not do.\n\
-             Write a brief, helpful reply (a few sentences at most). \
-             Reply with only the message text.",
+             If answering properly means looking something up, USE YOUR TOOLS \
+             before you reply — that is what they are for, and a grounded \
+             answer beats an offer to go and find out. If they asked for \
+             something you can produce right now, produce it rather than \
+             describing what you could do.\n\
+             Brevity is about the REPLY, not the effort: your text is posted \
+             verbatim, so write only the message, and keep it short unless \
+             they asked for something long.",
             author = mention.author,
             text = mention.text,
         );
