@@ -1116,6 +1116,61 @@ function openTab(next) {
   render();
 }
 
+// How many log entries the Activity tab shows before it stops. The chain is
+// verified over ALL of them — this is a reading limit, not a trust limit.
+const LOG_VISIBLE = 40;
+
+// "claude-haiku-4-5-20251001" → "haiku-4-5". The vendor and the build date
+// are noise once you are scanning thirty rows.
+function shortModel(model) {
+  if (!model) return '';
+  return String(model).replace(/-\d{8}$/, '').replace(/^claude-/, '');
+}
+
+function compactTokens(cost) {
+  if (!cost) return '';
+  const k = n => (n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n));
+  return `${k(cost.input_tokens || 0)}→${k(cost.output_tokens || 0)}`;
+}
+
+function shortWhen(seconds) {
+  const d = new Date(seconds * 1000);
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return sameDay ? `${hh}:${mm}` : `${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}`;
+}
+
+// One entry, one line. Everything that was on its own row before — the full
+// timestamp, the 64-character event id — is now either shortened or moved
+// into a tooltip, because none of it is what you scan for.
+function logRow(entry) {
+  const b = entry.body || {};
+  const row = el('div', 'logrow');
+  const when = el('span', 't', shortWhen(entry.at));
+  when.title = new Date(entry.at * 1000).toLocaleString();
+
+  const what = el('span', 'what');
+  what.append(el('b', null, b.action || '?'));
+  const outcome = b.outcome || '?';
+  const failed = /error|fail|refus|broken|expired/i.test(outcome);
+  what.append(document.createTextNode(' '), el('span', failed ? 'bad' : 'out', outcome));
+
+  const facts = [
+    shortModel(b.model),
+    compactTokens(b.cost),
+    b.detail?.timings_ms?.first_token_ms == null
+      ? null
+      : (b.detail.timings_ms.first_token_ms / 1000).toFixed(1) + 's',
+  ].filter(Boolean);
+  const meta = el('span', 'facts', facts.join(' · '));
+  if (entry.id) meta.title = 'event ' + entry.id;
+
+  row.append(when, what, meta);
+  return row;
+}
+
 function entryLine(bold, rest, metaLines) {
   const div = el('div', 'entry');
   div.append(el('b', null, bold));
@@ -2505,28 +2560,30 @@ async function renderLog(c) {
     if (!r.ok) return;
     for (const relay of (r.relays || [])) {
       out.append(entryLine(relay.relay, relay.ok ? `${(relay.events || []).length} events` : 'unreachable: ' + relay.error));
-      for (const e of (relay.events || []).slice(0, 30)) {
-        const b = e.body || {};
-        out.append(entryLine(b.action || (e.wrapped ? '(wrapped)' : '?'), '→ ' + (b.outcome || ''), [
-          new Date(e.at * 1000).toLocaleString() + (e.wrapped ? ' · self-tier (decrypted locally)' : ' · public'),
-          e.id,
-        ]));
+      for (const e of (relay.events || []).slice(0, LOG_VISIBLE)) {
+        if (!e.body) e.body = { action: e.wrapped ? '(wrapped)' : '?' };
+        const row = logRow(e);
+        row.title = e.wrapped ? 'self-tier, decrypted locally' : 'public tier';
+        out.append(row);
       }
     }
   };
 
-  for (const e of (d.entries || []).slice().reverse()) {
-    const b = e.body || {};
-    const meta = [
-      new Date(e.at * 1000).toLocaleString()
-        + (b.model ? ' · ' + b.model : '')
-        + (b.harness ? ' · ' + b.harness : '')
-        + (b.cost ? ` · ${b.cost.input_tokens}in/${b.cost.output_tokens}out` : '')
-        + (b.detail?.timings_ms?.first_token_ms == null ? ''
-          : ` · first text ${Math.round(b.detail.timings_ms.first_token_ms)}ms`),
-      e.id,
-    ];
-    c.append(entryLine(b.action || '?', '→ ' + (b.outcome || '?'), meta));
+  const all = (d.entries || []).slice().reverse();
+  const shown = all.slice(0, LOG_VISIBLE);
+  const list = el('div');
+  for (const e of shown) list.append(logRow(e));
+  c.append(list);
+  if (all.length > shown.length) {
+    const more = el('div', 'row');
+    const btn = el('button', 'btn', `SHOW ${all.length - shown.length} OLDER`);
+    more.append(btn, el('span', 'meta',
+      `showing the ${shown.length} most recent of ${all.length} · the chain above is verified over all of them`));
+    c.append(more);
+    btn.onclick = () => {
+      for (const e of all.slice(shown.length)) list.append(logRow(e));
+      more.remove();
+    };
   }
 }
 
