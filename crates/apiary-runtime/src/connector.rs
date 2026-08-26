@@ -172,6 +172,32 @@ pub fn bind_connectors_in(
             }));
         }
     }
+    // A connector knowledge home ADOPTS the knowledge base's write tool: it
+    // is taken out of the agent's toolset and re-offered only as `remember`.
+    // Leaving both would mean the attributed path is the polite one and the
+    // raw one is right beside it — and an unattributed claim in a shared
+    // knowledge base is exactly what we are preventing.
+    if let Some(home) = manifest
+        .memory
+        .knowledge_home
+        .as_ref()
+        .filter(|h| h.connector.is_some())
+    {
+        if let Some(wanted) = home.tool.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            let sanitized = crate::mcp::model_tool_name(wanted);
+            if let Some(pos) = out
+                .iter()
+                .position(|c| c.def().name == wanted || c.def().name == sanitized)
+            {
+                let write = out.remove(pos);
+                out.push(Box::new(RememberNote {
+                    home: home.clone(),
+                    to: Destination::Kb { write },
+                }));
+            }
+        }
+    }
+
     Ok(out)
 }
 
@@ -1973,11 +1999,15 @@ fn bind_vault(
         // AND that destination is one of the vaults this connector can
         // write. No declaration, no durable memory — the agent is not left
         // guessing where its knowledge should go.
-        if let Some(home) = home.filter(|h| vault_names.iter().any(|n| *n == h.vault)) {
+        if let Some(home) =
+            home.filter(|h| h.vault.as_deref().is_some_and(|v| vault_names.iter().any(|n| n == v)))
+        {
             out.push(Box::new(RememberNote {
-                kind,
-                vaults: shared.clone(),
                 home: home.clone(),
+                to: Destination::Vault {
+                    kind,
+                    vaults: shared.clone(),
+                },
             }));
         }
         out.push(Box::new(VaultWrite {
@@ -1998,36 +2028,54 @@ fn bind_vault(
 /// **Attribution is not optional and the agent cannot suppress it**: without
 /// it, nobody reading the knowledge base six months from now can tell a
 /// human decision from an agent's inference.
+/// Where a remembered note actually goes.
+enum Destination {
+    /// A filesystem vault: Obsidian, plain markdown, whatever the person
+    /// already keeps notes in.
+    Vault { kind: &'static str, vaults: Vaults },
+    /// A knowledge base reached over MCP. The wrapped tool is the KB's own
+    /// write tool, REMOVED from the agent's toolset and only reachable
+    /// through here — so a KB write cannot happen without attribution.
+    Kb { write: Box<dyn Connector> },
+}
+
 struct RememberNote {
-    kind: &'static str,
-    vaults: Vaults,
     home: apiary_core::manifest::KnowledgeHome,
+    to: Destination,
 }
 
 impl Connector for RememberNote {
     fn def(&self) -> ToolDef {
-        ToolDef {
-            name: "remember".into(),
-            description: format!(
-                "Write something you have learned into your knowledge home ({} in the {} \
-                 vault), where it survives this run and other people and agents can read \
-                 it. Use it for durable, reusable facts and decisions — not for chatter, \
-                 and not for what you merely did (that is already in your log). Your name \
-                 and the date are recorded automatically. Appends by default, so an \
-                 existing note grows rather than being overwritten.",
+        let where_ = match &self.to {
+            Destination::Vault { .. } => format!(
+                "{} in the {} vault",
                 self.home
                     .folder
                     .as_deref()
                     .filter(|f| !f.is_empty())
                     .unwrap_or("the root"),
-                self.home.vault,
+                self.home.vault.as_deref().unwrap_or("your"),
+            ),
+            Destination::Kb { .. } => format!(
+                "the {} knowledge base",
+                self.home.connector.as_deref().unwrap_or("shared"),
+            ),
+        };
+        ToolDef {
+            name: "remember".into(),
+            description: format!(
+                "Write something you have learned into your knowledge home ({where_}), where it \
+                 survives this run and other people and agents can read it. Use it for durable, \
+                 reusable facts and decisions — not for chatter, and not for what you merely did \
+                 (that is already in your log). Your name and the date are recorded \
+                 automatically."
             ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "description": "short title; the file is named from it"},
+                    "title": {"type": "string", "description": "short title for the note"},
                     "note": {"type": "string", "description": "what you learned, in markdown"},
-                    "replace": {"type": "boolean", "description": "rewrite the note instead of appending (default false)"},
+                    "replace": {"type": "boolean", "description": "rewrite rather than add to an existing note (default false)"},
                 },
                 "required": ["title", "note"],
             }),
@@ -2036,7 +2084,7 @@ impl Connector for RememberNote {
 
     fn execute(
         &self,
-        _custody: &Custody,
+        custody: &Custody,
         agent: &AgentHandle,
         args: &Value,
     ) -> Result<String, crate::Error> {
@@ -2056,33 +2104,50 @@ impl Connector for RememberNote {
             .get("replace")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let root = self
-            .vaults
-            .iter()
-            .find(|(name, _)| *name == self.home.vault)
-            .map(|(_, root)| root.clone())
-            .ok_or_else(|| {
-                crate::Error::Provider(format!(
-                    "knowledge home vault '{}' is not available on this host",
-                    self.home.vault
-                ))
-            })?;
-        // The HOST picks the path from the title — the agent never chooses
-        // where its memory lands.
-        let rel = self.home.note_path(title);
+        // Attribution the model cannot suppress: its own key, from custody,
+        // stamped into the body so it survives whatever schema the far side
+        // has. Without it nobody can tell an agent's inference from a human
+        // decision six months later.
+        let who = agent
+            .pubkey()
+            .to_bech32()
+            .unwrap_or_else(|_| agent.pubkey().to_hex());
         let stamp = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
-        // Attribution the agent cannot suppress: its own key, not a name
-        // it chose for itself.
-        let who = agent.pubkey().to_bech32().unwrap_or_else(|_| agent.pubkey().to_hex());
-        let entry = format!(
-            "\n---\n_Recorded by {who} · {stamp}_\n\n### {title}\n\n{note}\n"
-        );
-        write_into_vault(&root, &rel, &entry, !replace)?;
-        Ok(format!(
-            "Remembered in {} ({}). It is attributed to you and dated; anyone with the \
-             vault can read, correct, or build on it.",
-            rel, self.kind
-        ))
+        let body = format!("_Recorded by {who} · {stamp}_\n\n{note}");
+        match &self.to {
+            Destination::Vault { kind, vaults } => {
+                let vault_name = self.home.vault.as_deref().unwrap_or_default();
+                let root = vaults
+                    .iter()
+                    .find(|(name, _)| name == vault_name)
+                    .map(|(_, root)| root.clone())
+                    .ok_or_else(|| {
+                        crate::Error::Provider(format!(
+                            "knowledge home vault '{vault_name}' is not available on this host"
+                        ))
+                    })?;
+                // The HOST picks the path from the title — the agent never
+                // chooses where its memory lands.
+                let rel = self.home.note_path(title);
+                let entry = format!("\n---\n### {title}\n\n{body}\n");
+                write_into_vault(&root, &rel, &entry, !replace)?;
+                let _ = kind;
+                Ok(format!(
+                    "Remembered in {rel}. Attributed to you and dated; anyone with the vault \
+                     can read, correct, or build on it."
+                ))
+            }
+            Destination::Kb { write } => {
+                let payload = json!({
+                    self.home.title_field.clone(): title,
+                    self.home.body_field.clone(): body,
+                });
+                let result = write.execute(custody, agent, &payload)?;
+                Ok(format!(
+                    "Remembered in the knowledge base, attributed to you and dated. {result}"
+                ))
+            }
+        }
     }
 }
 

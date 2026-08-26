@@ -626,17 +626,42 @@ pub struct VaultRef {
 /// store the organization already keeps, where people can read, correct, and
 /// build on it. One place, declared, rather than knowledge scattered across
 /// whatever an agent happened to touch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KnowledgeHome {
-    /// A name from `memory.vaults`. Knowledge goes where the agent was
-    /// already granted access — this names a destination, never a new grant.
-    pub vault: String,
-    /// Optional subfolder for agent-written notes. Keeping them together
-    /// makes it obvious at a glance which parts of a shared knowledge base
-    /// an agent wrote.
+    /// A name from `memory.vaults` — knowledge lives in the filesystem
+    /// (Obsidian, plain markdown). Exactly one of `vault` or `connector`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault: Option<String>,
+    /// A granted connector's library name — knowledge lives in whatever
+    /// knowledge base the organization already runs, reached over MCP. The
+    /// vault speaks the filesystem and the KB speaks MCP; neither has to
+    /// learn the other's protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
+    /// For a connector home: the write tool to call. Required, because no
+    /// two knowledge bases name theirs the same thing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Optional subfolder for agent-written notes (vault homes). Keeping
+    /// them together makes it obvious which parts of a shared knowledge
+    /// base an agent wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<String>,
+    /// Field names the write tool expects. Defaults suit most KBs; override
+    /// where a server disagrees.
+    #[serde(default = "default_title_field")]
+    pub title_field: String,
+    #[serde(default = "default_body_field")]
+    pub body_field: String,
+}
+
+fn default_title_field() -> String {
+    "title".into()
+}
+
+fn default_body_field() -> String {
+    "content".into()
 }
 
 impl KnowledgeHome {
@@ -1235,12 +1260,60 @@ impl Manifest {
         // Knowledge home: a destination, never a grant. It must name a vault
         // the agent already has, and it may not point outside it.
         if let Some(home) = &self.memory.knowledge_home {
-            if !self.memory.vaults.iter().any(|v| v.name == home.vault) {
-                return Err(crate::Error::Manifest(format!(
-                    "memory.knowledge_home names vault '{}', which this agent has not been \
-                     granted (memory.vaults). A knowledge home is a destination, not a grant.",
-                    home.vault
-                )));
+            match (home.vault.as_deref(), home.connector.as_deref()) {
+                (Some(_), Some(_)) => {
+                    return Err(crate::Error::Manifest(
+                        "memory.knowledge_home names both a vault and a connector — pick one \
+                         place for durable knowledge, or the agent has to guess"
+                            .into(),
+                    ))
+                }
+                (None, None) => {
+                    return Err(crate::Error::Manifest(
+                        "memory.knowledge_home needs a vault or a connector".into(),
+                    ))
+                }
+                (None, Some(connector)) => {
+                    // A connector home reaches a knowledge base over MCP. It
+                    // is still a destination, not a grant: the connector must
+                    // already be in the manifest.
+                    if !self.connectors.iter().any(|c| {
+                        c.caps
+                            .get("library_name")
+                            .and_then(|v| v.as_str())
+                            .map(|n| n == connector)
+                            .unwrap_or(false)
+                            || c.kind == connector
+                    }) {
+                        return Err(crate::Error::Manifest(format!(
+                            "memory.knowledge_home names connector '{connector}', which this \
+                             agent has not been granted. A knowledge home is a destination, \
+                             not a grant."
+                        )));
+                    }
+                    if home
+                        .tool
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .is_none()
+                    {
+                        return Err(crate::Error::Manifest(format!(
+                            "memory.knowledge_home on connector '{connector}' must name the \
+                             `tool` that writes — knowledge bases do not agree on what it is \
+                             called"
+                        )));
+                    }
+                }
+                (Some(vault), None) => {
+                    if !self.memory.vaults.iter().any(|v| v.name == vault) {
+                        return Err(crate::Error::Manifest(format!(
+                            "memory.knowledge_home names vault '{vault}', which this agent has \
+                             not been granted (memory.vaults). A knowledge home is a \
+                             destination, not a grant."
+                        )));
+                    }
+                }
             }
             if let Some(folder) = &home.folder {
                 let path = std::path::Path::new(folder);

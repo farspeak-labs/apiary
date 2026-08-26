@@ -137,7 +137,7 @@ governance:
     ))
     .expect("a home in a granted vault validates");
     let home = ok.memory.knowledge_home.expect("home present");
-    assert_eq!(home.vault, "TeamKB");
+    assert_eq!(home.vault.as_deref(), Some("TeamKB"));
 
     // Points at a vault it was never given: refused, and says why.
     let error = manifest(&format!("{granted}  knowledge_home:\n    vault: SomeoneElsesKB\n"))
@@ -164,8 +164,9 @@ governance:
 fn the_host_decides_where_a_remembered_note_lands() {
     use apiary_core::manifest::KnowledgeHome;
     let home = KnowledgeHome {
-        vault: "TeamKB".into(),
+        vault: Some("TeamKB".into()),
         folder: Some("agent-notes".into()),
+        ..Default::default()
     };
     assert_eq!(
         home.note_path("Shrinkage varies by machine"),
@@ -179,8 +180,74 @@ fn the_host_decides_where_a_remembered_note_lands() {
     assert_eq!(home.note_path("  !!!  "), "agent-notes/note.md");
     // No folder: still inside the vault, still markdown.
     let flat = KnowledgeHome {
-        vault: "TeamKB".into(),
-        folder: None,
+        vault: Some("TeamKB".into()),
+        ..Default::default()
     };
     assert_eq!(flat.note_path("A Fact"), "a-fact.md");
+}
+
+/// A knowledge home can point at a knowledge base over MCP instead of a
+/// vault. The vault speaks the filesystem, the KB speaks MCP, and neither
+/// has to learn the other's protocol — but both are destinations, not grants.
+#[test]
+fn a_knowledge_home_may_live_in_a_connector_instead_of_a_vault() {
+    let manifest = |extra: &str| {
+        Manifest::from_yaml(&format!(
+            r#"
+manifest_version: 1
+identity:
+  npub: npub1m8mfxnr32mlkylq9s0cj5l6vheatdu39kaze26e65ptzfr8vudgse6kgv3
+inference:
+  - name: brain
+    provider: mock
+routing:
+  default: brain
+connectors:
+  - type: mcp
+    caps:
+      library_name: TeamKB
+      transport: http
+      url: https://example.invalid/mcp
+      allowed_tools: [kb_upsert]
+memory:
+  log: local
+{extra}
+governance:
+  suspend_keys:
+    - npub1kpmddremcthyftcuua6hjkt9hekc729j78qkhfgfvv35efjz0mnsgddfeg
+"#
+        ))
+    };
+
+    // A granted connector plus the tool that writes: valid.
+    let ok = manifest("  knowledge_home:\n    connector: TeamKB\n    tool: kb_upsert\n")
+        .expect("a KB home on a granted connector validates");
+    let home = ok.memory.knowledge_home.expect("home");
+    assert_eq!(home.connector.as_deref(), Some("TeamKB"));
+    assert_eq!(home.title_field, "title", "sensible default");
+    assert_eq!(home.body_field, "content");
+
+    // Naming the connector without saying which tool writes is refused:
+    // knowledge bases do not agree on what it is called.
+    let error = manifest("  knowledge_home:\n    connector: TeamKB\n")
+        .expect_err("a KB home needs its write tool named");
+    assert!(error.to_string().contains("must name the"), "{error}");
+
+    // A connector it was never granted is refused, same as a vault.
+    let error = manifest("  knowledge_home:\n    connector: SomeoneElsesKB\n    tool: write\n")
+        .expect_err("cannot write knowledge through a connector it lacks");
+    assert!(error.to_string().contains("not been granted"), "{error}");
+    assert!(error.to_string().contains("destination"), "{error}");
+
+    // Both at once is refused: one place for durable knowledge, not two.
+    let error = manifest(
+        "  vaults:\n    - name: V\n      path: /tmp/v\n  knowledge_home:\n    vault: V\n    connector: TeamKB\n    tool: kb_upsert\n",
+    )
+    .expect_err("two homes is no home");
+    assert!(error.to_string().contains("pick one place"), "{error}");
+
+    // Neither is refused too.
+    let error = manifest("  knowledge_home:\n    folder: notes\n")
+        .expect_err("a home must name somewhere");
+    assert!(error.to_string().contains("needs a vault or a connector"), "{error}");
 }

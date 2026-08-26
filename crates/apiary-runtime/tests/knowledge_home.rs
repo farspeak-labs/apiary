@@ -99,8 +99,9 @@ governance:
 fn a_remembered_note_is_stamped_with_who_said_it() {
     // The host, not the model, decides the filename and the attribution.
     let home = KnowledgeHome {
-        vault: "TeamKB".into(),
+        vault: Some("TeamKB".into()),
         folder: Some("agent-notes".into()),
+        ..Default::default()
     };
     // A title that tries to escape is slugified into the declared folder.
     assert_eq!(
