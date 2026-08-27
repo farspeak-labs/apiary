@@ -5296,12 +5296,15 @@ fn spawn_channel(
                         .str_config("trigger")
                         .map(String::from)
                         .unwrap_or_else(|| format!("@{name}"));
-                    Box::new(apiary_runtime::buzz::BuzzAdapter::connect_with_cursor(
+                    // Announce the agent by name on connect, so it appears as
+                    // itself rather than as a hex pubkey.
+                    Box::new(apiary_runtime::buzz::BuzzAdapter::connect_as(
                         &relay,
                         &custody,
                         &agent_handle,
                         trigger,
                         Some(dir.join("presence").join("buzz-recent.json")),
+                        Some(name.as_str()),
                     )?)
                 }
                 "telegram" => {

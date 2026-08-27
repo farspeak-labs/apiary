@@ -657,8 +657,32 @@ impl<'a> BuzzAdapter<'a> {
         trigger: String,
         cursor_path: Option<std::path::PathBuf>,
     ) -> Result<Self, crate::Error> {
+        Self::connect_as(relay, custody, handle, trigger, cursor_path, None)
+    }
+
+    /// Connect, and publish the agent's kind-0 profile so people see a NAME
+    /// rather than a hex pubkey.
+    ///
+    /// An agent asserting who it is, signed by its own key, is Apiary's job
+    /// and nobody else's — leaving it to a later manual step means the agent
+    /// shows up in every client as `aab49cec…61ba` until somebody notices.
+    /// Best effort: a relay that refuses the profile must not stop the agent
+    /// from listening.
+    pub fn connect_as(
+        relay: &str,
+        custody: &'a Custody,
+        handle: &'a AgentHandle,
+        trigger: String,
+        cursor_path: Option<std::path::PathBuf>,
+        display_name: Option<&str>,
+    ) -> Result<Self, crate::Error> {
         let mut session = BuzzSession::connect(relay, custody, handle)?;
         session.enable_keepalive(std::time::Duration::from_secs(15));
+        if let Some(name) = display_name.map(str::trim).filter(|n| !n.is_empty()) {
+            if let Err(e) = session.set_profile(name, None, None) {
+                eprintln!("buzz: could not publish profile for {name}: {e}");
+            }
+        }
         let channels = channel_ids(&mut session)?;
         let recent = RecentEventIds::load(cursor_path.as_deref());
         Ok(Self {
