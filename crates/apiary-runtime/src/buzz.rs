@@ -31,6 +31,10 @@ fn subscription_since(now: u64) -> u64 {
 /// churned, short enough that a lapse costs minutes rather than a day.
 const RESUBSCRIBE_AFTER_SILENCE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
+/// How often to look for channels created since the listener connected.
+/// Short enough that opening a DM with an agent feels immediate.
+const CHANNEL_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Default)]
 struct RecentEventIds {
     ids: std::collections::VecDeque<String>,
@@ -634,6 +638,10 @@ pub struct BuzzAdapter<'a> {
     handle: &'a AgentHandle,
     cursor_path: Option<std::path::PathBuf>,
     recent: RecentEventIds,
+    /// When the channel list was last re-read. A listener resolves its
+    /// channels once at connect, so a channel created afterwards — including
+    /// a DM someone opens with the agent — is invisible until it restarts.
+    channels_checked: std::time::Instant,
 }
 
 impl<'a> BuzzAdapter<'a> {
@@ -694,7 +702,41 @@ impl<'a> BuzzAdapter<'a> {
             handle,
             cursor_path,
             recent,
+            channels_checked: std::time::Instant::now(),
         })
+    }
+}
+
+
+impl BuzzAdapter<'_> {
+    /// Pick up channels created since the listener started.
+    ///
+    /// Someone opening a DM with an agent creates a new channel; so does
+    /// adding it to a channel. Neither is visible to a subscription that was
+    /// resolved once at connect, which is why an agent can look perfectly
+    /// healthy and never hear a word you say to it.
+    fn refresh_channels(&mut self) -> Result<(), crate::Error> {
+        if self.channels_checked.elapsed() < CHANNEL_REFRESH {
+            return Ok(());
+        }
+        self.channels_checked = std::time::Instant::now();
+        let current = channel_ids(&mut self.session)?;
+        let added: Vec<String> = current
+            .iter()
+            .filter(|c| !self.channels.contains(c))
+            .cloned()
+            .collect();
+        if added.is_empty() {
+            return Ok(());
+        }
+        eprintln!(
+            "buzz: {} new channel(s) since connect — subscribing",
+            added.len()
+        );
+        self.channels = current;
+        let channels = self.channels.clone();
+        self.session.subscribe_channels(&channels)?;
+        Ok(())
     }
 }
 
