@@ -1163,6 +1163,23 @@ pub(crate) async fn create_agent(
     Ok((npub, yaml, drafted_by))
 }
 
+/// The inference slot a NEW agent starts with.
+///
+/// Founding must not hand back an agent that cannot think. Defaulting to a
+/// provider whose credential this host does not have produces something that
+/// looks finished, passes validation, and fails every single run — which is
+/// exactly what happened to the first agent founded from a request here.
+///
+/// So: use the API key when the host actually holds one, otherwise fall back
+/// to the local Claude Code sign-in, which needs no key of its own.
+fn template_inference() -> (&'static str, &'static str) {
+    if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|v| !v.is_empty()) {
+        ("anthropic", "claude-opus-5")
+    } else {
+        ("claude-code", "claude-sonnet-5")
+    }
+}
+
 fn template_manifest(npub: &str, suspend: &[String], purpose: &str) -> String {
     let keys: String = suspend.iter().map(|k| format!("    - {k}\n")).collect();
     let constitution = serde_yaml::to_string(&Constitution {
@@ -1174,12 +1191,13 @@ fn template_manifest(npub: &str, suspend: &[String], purpose: &str) -> String {
         .lines()
         .map(|line| format!("  {line}\n"))
         .collect::<String>();
+    let (provider, model) = template_inference();
     format!(
         "manifest_version: 1\n\
          identity:\n  npub: {npub}\n\
          constitution:\n{constitution}\
          inference:\n\
-         - name: workhorse\n  provider: anthropic\n  model: claude-opus-5\n\
+         - name: workhorse\n  provider: {provider}\n  model: {model}\n\
          routing:\n  default: workhorse\n\
          connectors: []\n\
          memory:\n  log: local\n  index: local\n\

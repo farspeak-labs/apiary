@@ -1660,6 +1660,59 @@ function agentLifecycleSection(roster) {
   return lifecycle;
 }
 
+// A short, honest list of what is missing before an agent can work. Only
+// shown while something IS missing: a checklist of ticks is clutter.
+function readinessChecklist(c, m, roster, listener, spend) {
+  const gaps = [];
+  const slots = m.inference || [];
+  const language = slots.filter(s => inferenceRoleForName(s.name) === 'language');
+  if (!language.length) {
+    gaps.push(['No model', 'It cannot think until an inference slot is configured.', 'inference']);
+  } else if (language.some(s => s.provider === 'anthropic') && !hostStatus.anthropic_key_present) {
+    gaps.push([
+      'Its model will not run',
+      `${language.find(s => s.provider === 'anthropic').name} uses the Anthropic API, but this host has no key. `
+        + 'Every run will fail. Switch it to the local Claude Code sign-in, or give the agent its own sealed key.',
+      'inference',
+    ]);
+  }
+  if (!(m.connectors || []).length) {
+    gaps.push(['No capabilities', 'It can talk, but it cannot look anything up or produce anything.', 'connectors']);
+  }
+  const channels = Object.keys((m.presence || {}).channels || m.presence || {})
+    .filter(k => k !== 'channels');
+  if (!channels.length) {
+    gaps.push(['Nowhere to be spoken to', 'No always-on presence, so it only runs one-time tasks you start here.', 'workspace']);
+  } else if (!roster.active) {
+    gaps.push(['Not listening yet', `Presence is configured (${channels.join(', ')}) but the agent is inactive.`, null]);
+  }
+  const spendCap = spend && spend.budget_tokens_per_day;
+  if (spendCap && !spend.budget_proactive_tokens_per_day && ((m.watches || []).length || (m.routines || []).length)) {
+    gaps.push([
+      'Automations cannot run',
+      'It has routines or watches but no proactive allowance, so acting unasked is not funded.',
+      'manifest',
+    ]);
+  }
+  if (!gaps.length) return;
+  const box = el('div', 'ev');
+  box.style.borderColor = 'var(--line)';
+  box.append(el('b', null, `Before ${roster.name || 'this agent'} can do its job`));
+  for (const [title, why, tab] of gaps) {
+    const row = el('div', 'kv');
+    row.append(el('span', 'k', title), el('span', 'v', why));
+    box.append(row);
+    if (tab) {
+      const go = el('button', 'btn', 'Fix this');
+      go.style.marginTop = '4px';
+      go.onclick = () => openTab(tab);
+      box.append(go);
+    }
+  }
+  box.append(help('Buzz membership is separate: an agent must be a relay member to be reachable at all, and a member of a channel to see it. Both are managed in Buzz, not here.'));
+  c.append(box);
+}
+
 async function renderOverview(c) {
   const roster = agents.find(a => a.npub === sel) || {};
   const proposal = roster.archived
@@ -1697,6 +1750,11 @@ async function renderOverview(c) {
     };
   }
   const m = d.manifest || {};
+  // What still stands between this agent and doing its job. Creating an agent
+  // has a last mile — a model that works, capabilities, somewhere to be
+  // spoken to — and discovering each gap by trying something and watching it
+  // fail is the worst possible way to learn it.
+  readinessChecklist(c, m, roster, listener, spend);
   const models = m.inference || [];
   const taskModels = models.filter(x => inferenceRoleForName(x.name) === 'language');
   const supportingModels = models.filter(x => inferenceRoleForName(x.name) !== 'language');
