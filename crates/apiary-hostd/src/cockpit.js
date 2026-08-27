@@ -632,7 +632,9 @@ function watchForBrowserApproval(targetNpub, status, button, { restart = false, 
 }
 
 function browserApprovalControl(label, url, targetNpub, status) {
-  const button = el('button', 'btn', label);
+  // Same weight as the remote-signer button: these are two ways of doing the
+  // same thing, and which one suits you depends on where your signer lives.
+  const button = el('button', 'btn solid', label);
   button.type = 'button';
   watchForBrowserApproval(targetNpub, status, button);
   button.onclick = () => {
@@ -1049,14 +1051,15 @@ document.getElementById('k-go').onclick = async () => {
 function updateRatifyChip() {
   const chip = document.getElementById('c-ratify');
   if (!chip) return;
-  const waiting = (agents || []).filter(a => !a.ratified && !a.archived);
+  const waiting = (agents || []).filter(a => (a.waiting_on_you || []).length && !a.archived);
   chip.hidden = waiting.length === 0;
   if (!waiting.length) return;
   chip.textContent = waiting.length === 1
-    ? `${waiting[0].name || 'An agent'} needs approval`
-    : `${waiting.length} agents need approval`;
-  chip.title = 'Waiting for your approval: ' + waiting.map(a => a.name || shortNostrId(a.npub)).join(', ')
-    + ' — nothing runs until you approve it.';
+    ? `${waiting[0].name || 'An agent'} needs you`
+    : `${waiting.length} agents need you`;
+  chip.title = waiting
+    .map(a => `${a.name || shortNostrId(a.npub)}: ${(a.waiting_on_you || []).join(', ')}`)
+    .join(' · ');
   chip.onclick = () => {
     // Land on the one that has been waiting, in the tab that approves it.
     const target = waiting.find(a => a.npub === sel) || waiting[0];
@@ -1081,6 +1084,12 @@ async function loadRoster() {
     nm.append(el('span', 'badge ' + (a.ratified ? 'rat' : 'unrat'), a.ratified ? 'ratified' : 'unratified'));
     nm.append(el('span', 'badge ' + (a.archived ? 'unrat' : a.active ? 'live' : 'unrat'), a.archived ? 'archived' : a.active ? 'active' : 'inactive'));
     if (running.has(a.npub)) nm.append(el('span', 'badge live', 'listening'));
+    // Anything this agent needs a person for, said where people look first.
+    for (const w of (a.waiting_on_you || [])) {
+      const b = el('span', 'badge waiting', w === 'approval' ? 'needs approval'
+        : w === 'amendment' ? 'proposal waiting' : 'wants a new agent');
+      nm.append(b);
+    }
     card.append(nm, nostrId(a.npub, 'div', 'np'), el('div', 'np', a.log_entries + ' signed events'));
     card.onclick = () => { hostView = null; sel = a.npub; render(); loadRoster(); };
     return card;
@@ -1661,6 +1670,32 @@ async function renderOverview(c) {
   ]);
   await proposal;
   if (!d.ok) { c.append(el('div', 'ev err', 'Could not load this agent: ' + d.error)); return; }
+  // Approved but not running is one step from working, and that step used to
+  // be a button most of a page down inside a presence section. Put it where
+  // the state is visible.
+  if (d.ratified && !roster.active && !roster.archived) {
+    const go = el('div', 'ev');
+    go.style.borderColor = 'var(--amber)';
+    const name = roster.name || 'This agent';
+    go.append(el('b', null, `${name} is approved but not running`));
+    go.append(help('Activation starts its always-on channels and lets its automations fire on this host. One-time tasks work either way.'));
+    const r2 = el('div', 'row');
+    const on = el('button', 'btn solid', 'ACTIVATE');
+    const onSt = el('span', 'meta', '');
+    r2.append(on, onSt);
+    go.append(r2);
+    c.append(go);
+    on.onclick = async () => {
+      on.disabled = true;
+      onSt.textContent = 'activating…';
+      const r = await j(api('/active'), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ active: true }),
+      });
+      onSt.textContent = r.ok ? r.note : 'Could not activate: ' + r.error;
+      if (r.ok) { await loadRoster(); render(); } else { on.disabled = false; }
+    };
+  }
   const m = d.manifest || {};
   const models = m.inference || [];
   const taskModels = models.filter(x => inferenceRoleForName(x.name) === 'language');

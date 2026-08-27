@@ -655,6 +655,19 @@ async fn list_agents(
             continue;
         }
         let decision = agent_decision(&state, &dir, &npub, &raw, &m);
+        // What this agent is waiting on a person for. A pending request that
+        // is only visible after clicking into the agent is a request nobody
+        // knows about — the roster is where you look first, so it has to say.
+        let mut waiting: Vec<&str> = Vec::new();
+        if !decision.ratified && !ops::is_archived(&dir) {
+            waiting.push("approval");
+        }
+        if apiary_runtime::proposal::read_proposal(&dir).is_some() {
+            waiting.push("amendment");
+        }
+        if apiary_runtime::proposal::read_founding_request(&dir).is_some() {
+            waiting.push("new agent");
+        }
         agents.push(json!({
             "npub": npub,
             "name": name,
@@ -662,6 +675,7 @@ async fn list_agents(
             "log_entries": decision.log_entries,
             "active": ops::is_active(&dir),
             "archived": ops::is_archived(&dir),
+            "waiting_on_you": waiting,
             "declared_channels": m.presence.channels.keys().cloned().collect::<Vec<_>>(),
         }));
     }
