@@ -705,7 +705,7 @@ pub async fn decide_founding_proposal(
     headers: axum::http::HeaderMap,
     raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let (ks, npub, dir, _raw, _manifest) =
+    let (ks, npub, dir, _raw, manifest) =
         match crate::ops::gate_pub(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
             Ok(v) => v,
             Err(e) => return e.into_response(),
@@ -728,6 +728,60 @@ pub async fn decide_founding_proposal(
         .ok()
         .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(String::from))
         .unwrap_or_default();
+
+    // APPROVAL IS THE DOOR. Building exactly what the governor approved is
+    // executing their decision, not a new authority — so approving founds
+    // the agent rather than handing back a form to retype.
+    //
+    // The invariants that make that safe:
+    //   * The new agent is governed by the HUMANS who govern the requester.
+    //     An agent can never end up governing a colleague it asked for.
+    //   * It arrives unratified and inactive. Founding creates; ratification
+    //     animates. Nothing of it runs until a human signs.
+    //   * Capabilities are NOT auto-granted. Credentials are sealed per
+    //     agent and grants are their own ratified act; the request's list is
+    //     reported back so the governor knows what remains to hand over.
+    let mut founded = serde_json::Value::Null;
+    if accepted {
+        let governors: Vec<String> = manifest.governance.suspend_keys.clone();
+        if governors.iter().any(|g| g == &npub) {
+            return crate::err(
+                StatusCode::CONFLICT,
+                "the requesting agent governs itself — refusing to found a colleague under it",
+            )
+            .into_response();
+        }
+        if governors.is_empty() {
+            return crate::err(
+                StatusCode::CONFLICT,
+                "the requesting agent has no human governors to inherit — refusing to found",
+            )
+            .into_response();
+        }
+        match crate::create_agent(
+            &state,
+            &request.name,
+            &request.purpose,
+            &governors,
+            None,
+            Some(&request),
+        )
+        .await
+        {
+            Ok((new_npub, _yaml, built_from)) => {
+                founded = json!({
+                    "npub": new_npub,
+                    "name": request.name,
+                    "built_from": built_from,
+                    "governors": governors,
+                    "ratified": false,
+                    "still_to_grant": request.connectors,
+                    "skills_requested": request.skills,
+                });
+            }
+            Err((code, message)) => return crate::err(code, message).into_response(),
+        }
+    }
     apiary_runtime::proposal::clear_founding_request(&dir);
     if let Ok((custody, handle)) = admit_agent(&state, &ks, &npub) {
         let _ = EpisodicLog::open(&dir).append(
@@ -748,14 +802,16 @@ pub async fn decide_founding_proposal(
                 detail: Some(json!({
                     "request": request,
                     "governor_reason": governor_reason,
+                    "founded": founded,
                 })),
             },
         );
     }
     Json(json!({
-        "ok": true, "accepted": accepted, "request": request,
+        "ok": true, "accepted": accepted, "request": request, "founded": founded,
         "note": if accepted {
-            "approved — the founding flow is prefilled; the new agent still goes through review and ratification"
+            "founded from the approved request, unratified and inactive — review its \
+             configuration and ratify; capabilities it asked for still need granting"
         } else {
             "rejected and recorded where the agent can read it"
         },

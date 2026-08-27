@@ -1038,33 +1038,65 @@ async fn found_agent(
             return e.into_response();
         }
     }
-    let pass = match state.passphrase_clone() {
-        Some(p) => p,
-        None => {
-            return err(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "keystore is locked — unlock with the passphrase first",
-            )
-            .into_response()
-        }
-    };
-    let ks = match Keystore::open(&state.home) {
-        Ok(k) => k,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    let keys = apiary_core::identity::generate();
-    let npub = match apiary_core::identity::to_npub(&keys.public_key()) {
-        Ok(n) => n,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    if let Err(e) = ks.store(&keys, &pass) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    match create_agent(
+        &state,
+        &body.name,
+        &body.purpose,
+        &suspend,
+        body.draft_with.as_deref(),
+        None,
+    )
+    .await
+    {
+        Ok((npub, yaml, drafted_by)) => Json(json!({
+            "ok": true,
+            "npub": npub,
+            "name": body.name,
+            "yaml": yaml,
+            "drafted_by": drafted_by,
+            "ratified": false,
+            "note": "review the draft, amend as needed, then ratify — nothing runs unratified",
+        }))
+        .into_response(),
+        Err((code, message)) => err(code, message).into_response(),
     }
+}
 
-    let purpose = body.purpose.trim().to_string();
-    let template = template_manifest(&npub, &suspend, &purpose);
-    let (draft, drafted_by) = if body.draft_with.as_deref() == Some("anthropic") {
-        match draft_manifest_with_model(&npub, &body.purpose, &suspend, &template).await {
+/// Mint an agent: identity, keystore entry, drafted manifest, name file.
+///
+/// Shared by the two ways an agent comes to exist — a person filling in the
+/// founding form, and a person APPROVING another agent's founding request.
+/// The second is not a lesser path: approving a specific request IS the
+/// decision, and building exactly what was approved is execution rather than
+/// a new authority. Making someone retype an approved spec into a form is
+/// ceremony mistaken for control.
+///
+/// Either way the result is inert — unratified, inactive, and governed by
+/// the humans named in `suspend`.
+pub(crate) async fn create_agent(
+    state: &App,
+    name: &str,
+    purpose: &str,
+    suspend: &[String],
+    draft_with: Option<&str>,
+    shape: Option<&apiary_runtime::proposal::FoundingRequest>,
+) -> Result<(String, String, String), (StatusCode, String)> {
+    let pass = state.passphrase_clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "keystore is locked — unlock with the passphrase first".to_string(),
+    ))?;
+    let ks = Keystore::open(&state.home)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let keys = apiary_core::identity::generate();
+    let npub = apiary_core::identity::to_npub(&keys.public_key())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    ks.store(&keys, &pass)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let purpose = purpose.trim().to_string();
+    let template = template_manifest(&npub, suspend, &purpose);
+    let (draft, drafted_by) = if draft_with == Some("anthropic") {
+        match draft_manifest_with_model(&npub, &purpose, suspend, &template).await {
             Ok(y) => (y, "anthropic"),
             Err(e) => {
                 eprintln!("founding draft fell back to template: {e}");
@@ -1076,37 +1108,45 @@ async fn found_agent(
     };
     // Whatever drafted it, it must parse and pass invariants — or we fall
     // back to the template rather than storing an invalid constitution.
-    let (mut manifest, drafted_by) = match Manifest::from_yaml(&draft) {
-        Ok(manifest) => (manifest, drafted_by),
+    let (mut manifest, mut drafted_by) = match Manifest::from_yaml(&draft) {
+        Ok(manifest) => (manifest, drafted_by.to_string()),
         Err(_) => (
             Manifest::from_yaml(&template).expect("founding template must be valid"),
-            "template (model draft invalid)",
+            "template (model draft invalid)".to_string(),
         ),
     };
-    // The user's purpose is authoritative input, not something the drafting
-    // model may paraphrase away. Model-authored role/voice details remain a
-    // reviewable proposal around that fixed purpose.
+    // The purpose is authoritative input, not something a drafting model may
+    // paraphrase away.
     manifest.constitution.purpose = purpose;
+    // An APPROVED request is a specification, not a suggestion: what the
+    // governor read is what gets built.
+    if let Some(shape) = shape {
+        if !shape.role.trim().is_empty() {
+            manifest.constitution.role = shape.role.trim().to_string();
+        }
+        if !shape.principles.is_empty() {
+            manifest.constitution.principles = shape.principles.clone();
+        }
+        if !shape.boundaries.is_empty() {
+            manifest.constitution.boundaries = shape.boundaries.clone();
+        }
+        if let Some(tokens) = shape.tokens_per_day {
+            manifest
+                .governance
+                .budgets
+                .insert("tokens_per_day".into(), json!(tokens));
+        }
+        drafted_by = format!("the founding request {} filed", shape.by);
+    }
     let yaml = manifest
         .to_yaml()
-        .expect("validated founding manifest must serialize");
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let dir = ks.agent_dir(&npub);
-    if let Err(error) = agent_store::create_manifest(&dir, &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
-    }
-    if let Err(error) = std::fs::write(dir.join("name"), &body.name) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
-    }
-    Json(json!({
-        "ok": true,
-        "npub": npub,
-        "name": body.name,
-        "yaml": yaml,
-        "drafted_by": drafted_by,
-        "ratified": false,
-        "note": "review the draft, amend as needed, then ratify — nothing runs unratified",
-    }))
-    .into_response()
+    agent_store::create_manifest(&dir, &yaml)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    std::fs::write(dir.join("name"), name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((npub, yaml, drafted_by))
 }
 
 fn template_manifest(npub: &str, suspend: &[String], purpose: &str) -> String {

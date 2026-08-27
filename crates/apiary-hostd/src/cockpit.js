@@ -1522,20 +1522,39 @@ async function foundingBanner(c) {
   if (q.tokens_per_day) box.append(kv('proposed spend', q.tokens_per_day + ' tokens/day'));
   box.append(kv('requested', q.at ? new Date(q.at).toLocaleString() : '—'));
   const row = el('div', 'row');
-  const acc = el('button', 'btn solid', 'Approve — open founding');
+  const acc = el('button', 'btn solid', 'APPROVE — FOUND IT');
   const rej = el('button', 'btn danger', 'Reject');
   const why = el('input'); why.placeholder = 'why not? (recorded for the agent)'; why.className = 'grow';
   const st = el('span', 'meta', '');
   row.append(acc, rej, why, st);
-  box.append(row, help('Approving only opens the founding flow, prefilled from this request. The new agent still gets your review and ratification before anything runs. The decision is recorded where the requesting agent can read it.'));
+  box.append(row, help('Approving creates the agent from exactly this request — you already made the decision by approving, so you should not have to retype it into a form. It arrives unratified and inactive, governed by you, and nothing of it runs until you approve its configuration. Capabilities are not granted automatically. The decision is recorded where the requesting agent can read it.'));
   c.append(box);
   acc.onclick = async () => {
+    acc.disabled = true;
+    st.textContent = 'founding…';
     const r = await j(api('/founding-proposal/accept'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    acc.disabled = false;
     if (!r.ok) { st.textContent = 'Failed: ' + r.error; return; }
-    foundingPrefill = r.request;
-    hostView = 'found';
-    document.querySelectorAll('nav button').forEach(x => x.classList.remove('sel'));
-    render();
+    // Approving BUILDS it. The agent exists now — unratified, inactive, and
+    // governed by you — so go look at what was made rather than at a form.
+    const f = r.founded || {};
+    window.__libFlash = null;
+    await loadRoster();
+    if (f.npub) {
+      sel = f.npub;
+      hostView = null;
+      openTab('manifest');
+      const pending = (f.still_to_grant || []).length
+        ? ` Still to grant: ${(f.still_to_grant || []).join(', ')}.`
+        : '';
+      setTimeout(() => alert(
+        `${f.name || 'The agent'} exists, built from the approved request.\n\n`
+        + `It is unratified and inactive — nothing of it runs until you approve its `
+        + `configuration. You govern it.${pending}`), 50);
+    } else {
+      st.textContent = 'approved';
+      render();
+    }
   };
   rej.onclick = async () => {
     const r = await j(api('/founding-proposal/reject'), {
