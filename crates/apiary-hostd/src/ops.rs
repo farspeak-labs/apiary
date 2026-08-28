@@ -5429,6 +5429,7 @@ pub fn spawn_supervisor(state: App) {
             reconcile(&state, &mut backoff);
             crate::routines::reconcile_routines(&state);
             crate::watches::reconcile_watches(&state);
+            crate::errands::reconcile_errands(&state);
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     });

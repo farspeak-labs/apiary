@@ -230,7 +230,7 @@ pub fn run_task_observed(
     //    capabilities exist) and infer. Every dispatch is logged BEFORE the
     //    result returns to the model — the track record sees each action.
     let connectors_started = std::time::Instant::now();
-    let connectors = if ctx.disable_tools || ctx.lightweight {
+    let mut connectors = if ctx.disable_tools || ctx.lightweight {
         Vec::new()
     } else {
         prep!(crate::connector::bind_connectors_in(
@@ -240,6 +240,18 @@ pub fn run_task_observed(
             Some(agent_dir)
         ))
     };
+    // The one capability that is not in the manifest: carrying THIS
+    // request past the end of THIS run. It comes from the door a person
+    // opened, so it exists exactly as long as that door does.
+    if let Some(door) = ctx.errand_door.clone() {
+        if !ctx.disable_tools && !ctx.lightweight {
+            if door.errand_id.is_some() {
+                connectors.push(Box::new(crate::errands::AskRequester { door }));
+            } else {
+                connectors.push(Box::new(crate::errands::FollowUp { door }));
+            }
+        }
+    }
     // What this run was actually OFFERED. "Do you have access to X?" was
     // only answerable by asking the model, which answers from its own
     // prompt — so a connector that silently bound nothing and a model that

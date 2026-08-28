@@ -15,8 +15,10 @@
 //! - Bounded by a token ceiling and an expiry, both deliberately generous:
 //!   the expensive failure is work not getting done, not tokens spent.
 
+use apiary_core::custody::{AgentHandle, Custody};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 
 pub const STATE_FILE: &str = "errands.json";
@@ -209,9 +211,355 @@ pub fn task_text(errand: &Errand) -> String {
     )
 }
 
+/// The open door a run inherits from the person who spoke to it. Present
+/// only on runs a person initiated — a routine, a watch, or an errand run
+/// carries no door, so `follow_up` is simply not among their tools. That is
+/// the enforcement: not a rule the model is asked to follow.
+#[derive(Debug, Clone)]
+pub struct Door {
+    pub agent_dir: PathBuf,
+    pub channel_kind: String,
+    pub channel: String,
+    pub requested_by: String,
+    pub reply_ref: Option<String>,
+    /// Set when this run IS an errand. It changes which tool the door
+    /// carries — `ask_requester` instead of `follow_up` — so "an errand
+    /// cannot file an errand" is a property of the code rather than an
+    /// instruction the model is asked to respect.
+    pub errand_id: Option<String>,
+}
+
+/// How much unfinished work one agent may owe at once. Low on purpose: a
+/// person who asks for six things should be told the sixth will not happen
+/// rather than discover later that it silently didn't.
+pub const MAX_PENDING: usize = 3;
+/// The longest an errand may be deferred by the request's own timing.
+const MAX_DEFER_MINS: i64 = 24 * 60;
+
+/// `follow_up` — the tool that carries a request past the end of a run.
+pub struct FollowUp {
+    pub door: Door,
+}
+
+impl crate::connector::Connector for FollowUp {
+    fn def(&self) -> crate::connector::ToolDef {
+        crate::connector::ToolDef {
+            name: "follow_up".into(),
+            description: format!(
+                "Take on a piece of work you cannot finish inside this reply, and \
+                 actually finish it afterwards. The host runs it shortly, on its own, \
+                 and delivers the result back to this conversation — so filing it is \
+                 the ONLY honest way to say 'I will send you that'. If you say you \
+                 will and file nothing, you have lied to someone who is now waiting. \
+                 Use it for work worth minutes, not seconds: a draft, a review, \
+                 something that needs several lookups. Do the small things now \
+                 instead. You may owe at most {MAX_PENDING} pieces of work at once."
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "one line, in your own words — repeated back to the person and shown to your governor"
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "what you will actually do, written for yourself later, when this conversation is no longer in front of you. Include everything you would need."
+                    },
+                    "start_in_minutes": {
+                        "type": "integer",
+                        "description": "leave unset to start right away; set it only when the request itself asked for later ('first thing tomorrow')"
+                    }
+                },
+                "required": ["summary", "task"]
+            }),
+        }
+    }
+
+    fn execute(
+        &self,
+        custody: &Custody,
+        agent: &AgentHandle,
+        args: &serde_json::Value,
+    ) -> Result<String, crate::Error> {
+        let text = |key: &str| {
+            args[key]
+                .as_str()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        let summary =
+            text("summary").ok_or_else(|| crate::Error::Provider("summary required".into()))?;
+        let task = text("task").ok_or_else(|| crate::Error::Provider("task required".into()))?;
+
+        let file = ErrandsFile::open(&self.door.agent_dir);
+        let mut state = file.load();
+        let now = Utc::now();
+        state.prune(now);
+        let outstanding = state.outstanding().count();
+        if outstanding >= MAX_PENDING {
+            // Refusing is not failing: the agent needs to be able to say
+            // this out loud in its reply rather than promise a fourth thing.
+            return Ok(format!(
+                "Not filed — you already owe {outstanding} unfinished piece(s) of work, \
+                 which is the limit. Tell them plainly that you cannot take this on until \
+                 you have delivered what you already owe, and say what that is."
+            ));
+        }
+        let start_after = args["start_in_minutes"]
+            .as_i64()
+            .filter(|minutes| *minutes > 0)
+            .map(|minutes| now + Duration::minutes(minutes.min(MAX_DEFER_MINS)));
+        let errand = Errand {
+            id: format!("e{}", now.timestamp_nanos_opt().unwrap_or(now.timestamp())),
+            summary: summary.clone(),
+            task,
+            channel_kind: self.door.channel_kind.clone(),
+            channel: self.door.channel.clone(),
+            requested_by: self.door.requested_by.clone(),
+            reply_ref: self.door.reply_ref.clone(),
+            state: State::Pending,
+            filed_at: now,
+            start_after,
+            expires_at: now + Duration::minutes(DEFAULT_EXPIRY_MINS),
+            tokens: DEFAULT_TOKENS,
+            question: None,
+            answer: None,
+            questions_asked: 0,
+            outcome: None,
+        };
+        let id = errand.id.clone();
+        state.errands.push(errand);
+        file.save(&state)
+            .map_err(|error| crate::Error::Provider(format!("could not file the errand: {error}")))?;
+
+        // The promise is now a record, and the record is signed.
+        let log = apiary_core::log::EpisodicLog::open(&self.door.agent_dir);
+        log.append(
+            custody,
+            agent,
+            apiary_core::log::Tier::Self_,
+            &apiary_core::log::EntryBody {
+                action: "errand.filed".into(),
+                model: None,
+                cost: None,
+                harness: Some("native".into()),
+                outcome: "pending".into(),
+                detail: Some(json!({
+                    "errand": id,
+                    "summary": summary,
+                    "channel_kind": self.door.channel_kind,
+                    "channel": self.door.channel,
+                    "requested_by": self.door.requested_by,
+                    "start_after": start_after,
+                })),
+            },
+        )?;
+        Ok(format!(
+            "Filed as {id}. Now finish your reply: tell them you are doing it and roughly \
+             when it will land, in one sentence. Do not describe it as already done, and do \
+             not paste a draft of it here — the finished work arrives in this conversation \
+             on its own."
+        ))
+    }
+}
+
+/// `ask_requester` — the way a stuck errand asks instead of failing.
+pub struct AskRequester {
+    pub door: Door,
+}
+
+impl crate::connector::Connector for AskRequester {
+    fn def(&self) -> crate::connector::ToolDef {
+        crate::connector::ToolDef {
+            name: "ask_requester".into(),
+            description:
+                "Ask the person who requested this work one focused question, when \
+                 something genuinely blocks you and one line from them would unblock it. \
+                 The question is posted back to them and the work is parked until they \
+                 answer, then resumes carrying their answer. Ask about the WORK — which \
+                 product line, which of two readings they meant. Never ask for permission \
+                 to continue: they already asked you for this. One question at a time, \
+                 and only when guessing would waste more than asking."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "the question, in one or two sentences, standing on its own — they may read it hours later with no other context"
+                    }
+                },
+                "required": ["question"]
+            }),
+        }
+    }
+
+    fn execute(
+        &self,
+        custody: &Custody,
+        agent: &AgentHandle,
+        args: &serde_json::Value,
+    ) -> Result<String, crate::Error> {
+        let question = args["question"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| crate::Error::Provider("question required".into()))?
+            .to_string();
+        let Some(id) = self.door.errand_id.clone() else {
+            return Err(crate::Error::Provider(
+                "ask_requester is only available while finishing filed work".into(),
+            ));
+        };
+        let file = ErrandsFile::open(&self.door.agent_dir);
+        let mut state = file.load();
+        let now = Utc::now();
+        let Some(errand) = state.errands.iter_mut().find(|errand| errand.id == id) else {
+            return Err(crate::Error::Provider("that work is no longer on file".into()));
+        };
+        errand.ask(question.clone(), now);
+        let asked = errand.questions_asked;
+        file.save(&state)
+            .map_err(|error| crate::Error::Provider(format!("could not park the work: {error}")))?;
+
+        let log = apiary_core::log::EpisodicLog::open(&self.door.agent_dir);
+        log.append(
+            custody,
+            agent,
+            apiary_core::log::Tier::Self_,
+            &apiary_core::log::EntryBody {
+                action: "errand.asked".into(),
+                model: None,
+                cost: None,
+                harness: Some("native".into()),
+                outcome: "waiting".into(),
+                detail: Some(json!({
+                    "errand": id,
+                    "question": question,
+                    "questions_asked": asked,
+                })),
+            },
+        )?;
+        Ok("Your question will be posted to them and this work is parked until they \
+            answer. Stop now — do not also guess an answer and carry on."
+            .into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::Connector;
+    use nostr::prelude::*;
+
+    /// A door, a scratch agent dir, and the custody to sign its log.
+    fn door_for(dir: &Path, errand_id: Option<&str>) -> (Door, Custody, AgentHandle) {
+        let mut custody = Custody::new();
+        let handle = custody.admit(Keys::generate());
+        let door = Door {
+            agent_dir: dir.to_path_buf(),
+            channel_kind: "buzz".into(),
+            channel: "welcome-everyone".into(),
+            requested_by: "Ryan".into(),
+            reply_ref: None,
+            errand_id: errand_id.map(str::to_string),
+        };
+        (door, custody, handle)
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("apiary-errands-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The cap has to REFUSE in a way the agent can repeat out loud. An
+    /// error would be swallowed as a tool failure and the person would be
+    /// promised a fourth thing anyway.
+    #[test]
+    fn past_the_cap_it_declines_in_words_rather_than_failing() {
+        let dir = scratch("cap");
+        let (door, custody, handle) = door_for(&dir, None);
+        let tool = FollowUp { door };
+        for i in 0..MAX_PENDING {
+            let out = tool
+                .execute(
+                    &custody,
+                    &handle,
+                    &json!({ "summary": format!("thing {i}"), "task": "do it" }),
+                )
+                .expect("filing within the cap works");
+            assert!(out.starts_with("Filed as e"), "{out}");
+        }
+        let refused = tool
+            .execute(
+                &custody,
+                &handle,
+                &json!({ "summary": "one too many", "task": "do it" }),
+            )
+            .expect("the cap declines, it does not error");
+        assert!(refused.starts_with("Not filed"), "{refused}");
+        assert!(refused.contains("cannot take this on"), "{refused}");
+        let state = ErrandsFile::open(&dir).load();
+        assert_eq!(state.errands.len(), MAX_PENDING, "the fourth was not filed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rule that matters most in the scope: an errand cannot file an
+    /// errand. It holds because the errand run is handed a door carrying
+    /// the other tool — not because the model was told not to.
+    #[test]
+    fn an_errand_run_is_handed_the_asking_tool_not_the_filing_one() {
+        let dir = scratch("mode");
+        let (filing, _, _) = door_for(&dir, None);
+        let (working, _, _) = door_for(&dir, Some("e1"));
+        assert!(filing.errand_id.is_none());
+        assert_eq!(FollowUp { door: filing }.def().name, "follow_up");
+        assert_eq!(
+            AskRequester { door: working }.def().name,
+            "ask_requester"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Asking parks the work and records the question where the supervisor
+    /// will find it — the run ending is not the same as the work ending.
+    #[test]
+    fn asking_parks_the_work_against_its_own_row() {
+        let dir = scratch("ask");
+        let (filing, custody, handle) = door_for(&dir, None);
+        FollowUp { door: filing }
+            .execute(
+                &custody,
+                &handle,
+                &json!({ "summary": "press release", "task": "draft it" }),
+            )
+            .unwrap();
+        let id = ErrandsFile::open(&dir).load().errands[0].id.clone();
+        let (working, _, _) = door_for(&dir, Some(&id));
+        AskRequester { door: working }
+            .execute(
+                &custody,
+                &handle,
+                &json!({ "question": "Which product line?" }),
+            )
+            .unwrap();
+        let state = ErrandsFile::open(&dir).load();
+        assert_eq!(state.errands[0].state, State::Asked);
+        assert_eq!(
+            state.errands[0].question.as_deref(),
+            Some("Which product line?")
+        );
+        assert!(state.errands[0].state.is_outstanding(), "still owed");
+        // And asking about work that is gone is an error, not a silent no-op.
+        let (orphan, _, _) = door_for(&dir, Some("nope"));
+        assert!(AskRequester { door: orphan }
+            .execute(&custody, &handle, &json!({ "question": "hello?" }))
+            .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn errand(state: State, now: DateTime<Utc>) -> Errand {
         Errand {

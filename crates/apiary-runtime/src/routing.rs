@@ -36,6 +36,10 @@ pub struct TaskContext {
     /// intentions) draw on the proactive sub-lane; everything a person or
     /// a ratified schedule asked for stays responsive.
     pub lane: crate::spend::Lane,
+    /// Set only when a person opened this run and is waiting on it. It is
+    /// what makes `follow_up` available, so an errand cannot file an
+    /// errand and a schedule cannot authorize itself more work.
+    pub errand_door: Option<crate::errands::Door>,
 }
 
 fn rule_matches(rule: &RoutingRule, ctx: &TaskContext) -> bool {

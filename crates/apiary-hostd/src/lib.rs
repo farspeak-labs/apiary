@@ -18,6 +18,7 @@ pub mod nip46;
 pub mod nip98;
 pub mod ops;
 pub mod routines;
+pub mod errands;
 pub mod watches;
 
 use apiary_core::{
@@ -333,6 +334,11 @@ pub fn build_router(state: App) -> Router {
         )
         .route("/api/agents/{npub}/routines", get(routines::list_routines))
         .route("/api/agents/{npub}/watches", get(watches::list_watches))
+        .route("/api/agents/{npub}/errands", get(errands::list_errands))
+        .route(
+            "/api/agents/{npub}/errands/cancel",
+            post(errands::cancel_errand),
+        )
         .route(
             "/api/agents/{npub}/routines/{name}/run",
             post(routines::run_routine_now),
