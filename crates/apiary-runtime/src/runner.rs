@@ -240,6 +240,16 @@ pub fn run_task_observed(
             Some(agent_dir)
         ))
     };
+    // What this run was actually OFFERED. "Do you have access to X?" was
+    // only answerable by asking the model, which answers from its own
+    // prompt — so a connector that silently bound nothing and a model that
+    // chose not to look were indistinguishable in the record. They are the
+    // same question a governor asks and a different fix each time.
+    let offered_tools: Vec<String> = connectors
+        .iter()
+        .map(|connector| connector.def().name)
+        .collect();
+    let tool_calls = std::cell::Cell::new(0u32);
     // Input counts against the ceiling: refuse before dispatch when the
     // working set alone would consume the reservation.
     let images: Vec<crate::inference::ImageInput> = ctx
@@ -393,6 +403,7 @@ pub fn run_task_observed(
                 connectors.iter().map(|connector| connector.def()).collect();
             let mut dispatch = |name: &str, args: &serde_json::Value| {
                 tool_started.set(true);
+                tool_calls.set(tool_calls.get() + 1);
                 emit(RunEvent::ToolCallStarted {
                     name: name.into(),
                     args: args.clone(),
@@ -529,6 +540,8 @@ pub fn run_task_observed(
                 "slot": slot_name,
                 "fallback_attempts": attempt_failures,
                 "skills": selected_skill_names,
+                "tools_offered": offered_tools,
+                "tool_calls": tool_calls.get(),
                 "response_chars": completion.text.len(),
                 "transcription": transcription_records,
                 "timings_ms": logged_timings,

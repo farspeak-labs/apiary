@@ -725,16 +725,18 @@ function setHostHealth(state, detail) {
   const name = hostDisplayName();
   const label = state === 'online' ? `${name} · Online`
     : state === 'offline' ? `${name} · Unreachable`
-      : `${name} · Checking`;
+      : state === 'signedout' ? `${name} · Signed out`
+        : `${name} · Checking`;
   const toggle = document.getElementById('host-status-toggle');
   const statusLabel = document.getElementById('host-status-label');
   const health = document.getElementById('c-health');
   statusLabel.textContent = label;
   toggle.classList.toggle('is-online', state === 'online');
-  toggle.classList.toggle('is-offline', state === 'offline');
+  toggle.classList.toggle('is-offline', state !== 'online' && state !== 'checking');
   toggle.title = detail || label;
   health.textContent = label;
-  health.className = 'chip' + (state === 'online' ? ' ok' : state === 'offline' ? ' bad' : '');
+  health.className = 'chip' + (state === 'online' ? ' ok'
+    : (state === 'offline' || state === 'signedout') ? ' bad' : '');
   health.title = detail || label;
 }
 
@@ -904,7 +906,12 @@ async function loadStatus() {
     if (!hostStatus.ok) throw new Error(hostStatus.error || 'Could not load this Apiary host.');
   } catch (error) {
     const message = error && error.message ? error.message : 'Could not reach this Apiary host.';
-    setHostHealth('offline', message);
+    // A refused session and an unreachable host look identical from here —
+    // one fetch that did not come back — and calling both "Unreachable"
+    // sends you to debug a network that is fine. The daemon restarting
+    // drops every in-memory session, so this is the common case.
+    const signedOut = /session|sign-?in|signed|manager|credential|refus|unauthor|401/i.test(message);
+    setHostHealth(signedOut ? 'signedout' : 'offline', message);
     throw error;
   }
   setHostHealth('online', `${hostDisplayName()} is connected and responding.`);
@@ -1191,6 +1198,28 @@ function entryLine(bold, rest, metaLines) {
 // ------------------------------------------------------------ tabs
 
 async function render() {
+  try {
+    await renderInner();
+  } catch (error) {
+    // Every fetch in here can fail at once (a restarted daemon, a dropped
+    // tunnel). Before, the first rejection escaped after the content pane
+    // had already been cleared, so the window went blank and clicking
+    // another agent appeared to do nothing at all. Say what happened.
+    console.error(error);
+    const c = document.getElementById('content');
+    if (c && !c.childElementCount) {
+      const panel = el('div', 'attention');
+      panel.append(el('h2', null, 'This view could not load'));
+      panel.append(help((error && error.message) || 'The host did not answer.'));
+      const again = el('button', 'btn solid', 'Try again');
+      again.onclick = () => { loadStatus().catch(() => {}); render(); loadRoster(); };
+      panel.append(again);
+      c.append(panel);
+    }
+  }
+}
+
+async function renderInner() {
   if (listenerPoll) { clearInterval(listenerPoll); listenerPoll = null; }
   if (browserApprovalWatch && (browserApprovalWatch.targetNpub !== sel || hostView)) {
     stopBrowserApprovalWatch();

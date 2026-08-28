@@ -96,25 +96,38 @@ export function createApiaryClient(token) {
     if (!desktopAccess) throw new Error('The SSH desktop credential is unavailable. Reconnect this workspace.');
     if (desktopConnecting) return desktopConnecting;
     desktopConnecting = (async () => {
-      const response = await fetch('/api/desktop/session', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-          authorization: 'Bearer ' + desktopAccess,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify(manager ? { manager } : {}),
-      });
-      const result = await response.json().catch(() => ({}));
-      if (response.status === 409 && Array.isArray(result.managers)) {
-        const error = new Error(result.error || 'Choose an approved manager for this desktop session.');
-        error.desktopManagers = result.managers;
-        throw error;
+      let choice = manager || null;
+      // Two passes at most: the first may learn WHICH identity to renew as.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await fetch('/api/desktop/session', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            authorization: 'Bearer ' + desktopAccess,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify(choice ? { manager: choice } : {}),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (response.status === 409 && Array.isArray(result.managers)) {
+          // The host refuses to guess between approved managers. That is
+          // right for a NEW sign-in and wrong for a RENEWAL: this session
+          // already had an identity, and the daemon restarting is not a
+          // reason to ask again. Come back as whoever we already were;
+          // only a genuinely unknown identity is worth a question.
+          const known = sessionNpub
+            && result.managers.some(entry => entry.npub === sessionNpub);
+          if (!choice && known) { choice = sessionNpub; continue; }
+          const error = new Error(result.error || 'Choose an approved manager for this desktop session.');
+          error.desktopManagers = result.managers;
+          throw error;
+        }
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || `Desktop authentication was refused (${response.status}).`);
+        }
+        return rememberSession(result);
       }
-      if (!response.ok || !result.ok) {
-        throw new Error(result.error || `Desktop authentication was refused (${response.status}).`);
-      }
-      return rememberSession(result);
+      throw new Error('This workspace could not renew its desktop session.');
     })();
     try {
       return await desktopConnecting;
