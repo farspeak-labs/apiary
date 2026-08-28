@@ -8,7 +8,7 @@ whose compromise would be catastrophic.
 ## Reporting a vulnerability
 
 Please report vulnerabilities through a private GitHub security advisory for
-`prellr/apiary`. Do not open a public issue containing an exploit, credential,
+`farspeak-labs/apiary`. Do not open a public issue containing an exploit, credential,
 private Nostr key, access token, host address, or agent export.
 
 Include the affected commit or version, platform, configuration, reproduction

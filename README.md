@@ -13,7 +13,7 @@ connection read-only, allow writing when needed, set spending limits, and
 decide who may operate or change the agent. Changing models or moving to
 another machine does not erase the agent's identity, instructions, or history.
 
-[![CI](https://github.com/prellr/apiary/actions/workflows/ci.yml/badge.svg)](https://github.com/prellr/apiary/actions/workflows/ci.yml)
+[![CI](https://github.com/farspeak-labs/apiary/actions/workflows/ci.yml/badge.svg)](https://github.com/farspeak-labs/apiary/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 > Apiary is under active development. Its core desktop, server, connector,
@@ -108,7 +108,7 @@ Requirements: a current Rust toolchain and the platform dependencies required
 by [Tauri 2](https://v2.tauri.app/start/prerequisites/).
 
 ```bash
-git clone https://github.com/prellr/apiary.git
+git clone https://github.com/farspeak-labs/apiary.git
 cd apiary
 cargo run -p apiary-desktop
 ```

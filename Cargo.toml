@@ -6,7 +6,7 @@ members = ["crates/apiary-core", "crates/apiary-runtime", "crates/apiary-cli", "
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/prellr/apiary"
+repository = "https://github.com/farspeak-labs/apiary"
 
 [workspace.dependencies]
 # nip46 is required alongside nip49 in nostr 0.45.1 (upstream feature-gate bug:
