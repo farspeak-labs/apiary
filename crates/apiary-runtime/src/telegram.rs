@@ -157,9 +157,49 @@ impl TelegramAdapter {
     }
 }
 
+/// Telegram shows a chat action for about five seconds, so this is a
+/// heartbeat too. It names the right activity: a voice reply announces
+/// itself as recording, because "typing" followed by audio is a small lie.
+struct TelegramTyping<'a> {
+    client: &'a reqwest::blocking::Client,
+    token: &'a str,
+    chat_id: i64,
+    action: &'static str,
+}
+
+impl crate::presence::TypingPulse for TelegramTyping<'_> {
+    fn pulse(&mut self) {
+        let _ = self
+            .client
+            .post(format!(
+                "https://api.telegram.org/bot{}/sendChatAction",
+                self.token
+            ))
+            .json(&serde_json::json!({
+                "chat_id": self.chat_id,
+                "action": self.action,
+            }))
+            .send();
+    }
+}
+
 impl crate::presence::ChannelAdapter for TelegramAdapter {
     fn kind(&self) -> &'static str {
         "telegram"
+    }
+
+    fn typing<'a>(
+        &'a mut self,
+        channel: &str,
+        voice: bool,
+    ) -> Option<Box<dyn crate::presence::TypingPulse + 'a>> {
+        let chat_id = channel.parse::<i64>().ok()?;
+        Some(Box::new(TelegramTyping {
+            client: &self.client,
+            token: &self.token,
+            chat_id,
+            action: if voice { "record_voice" } else { "typing" },
+        }))
     }
 
     fn describe(&self) -> String {

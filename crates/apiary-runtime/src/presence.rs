@@ -135,6 +135,19 @@ pub struct Mention {
 /// a day of chatter through inference.
 pub const RECENT_CONTEXT_MESSAGES: usize = 12;
 
+/// Something that can keep saying "still working" while a run is in
+/// flight. Platforms expire these fast on purpose — a stuck indicator is
+/// worse than none — so it is re-announced every few seconds and stops the
+/// moment the run ends, whether it ended well or badly.
+pub trait TypingPulse: Send {
+    fn pulse(&mut self);
+}
+
+/// How often to re-announce. Buzz drops an indicator 8s after the last
+/// event; Telegram's chat action lasts about 5s. Three seconds satisfies
+/// both with room for a slow round trip.
+pub const TYPING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub trait ChannelAdapter {
     fn kind(&self) -> &'static str;
     fn describe(&self) -> String;
@@ -156,6 +169,25 @@ pub trait ChannelAdapter {
     /// context-free rather than broken.
     fn recent_context(&mut self, _channel: &str, _limit: usize) -> Vec<(String, String)> {
         Vec::new()
+    }
+
+    /// Show that the agent is working on it, for as long as it is.
+    ///
+    /// A run can take twenty seconds; from the other side that is
+    /// indistinguishable from being ignored, and people repeat themselves
+    /// or walk away. The returned pulse borrows the adapter, so it holds
+    /// the platform connection the adapter already has rather than opening
+    /// a second one. `voice` picks the honest verb where a platform has
+    /// one — recording, not typing.
+    ///
+    /// Default: none. A platform with no such affordance is quiet, not
+    /// broken.
+    fn typing<'a>(
+        &'a mut self,
+        _channel: &str,
+        _voice: bool,
+    ) -> Option<Box<dyn TypingPulse + 'a>> {
+        None
     }
 }
 
@@ -331,7 +363,46 @@ pub fn run_presence(
                 .map(|slot| format!(" · {slot}"))
                 .unwrap_or_default()
         ));
-        let outcome = crate::runner::run_task(manifest, agent_dir, custody, handle, &task, &ctx);
+        let reply_as = ReplyAs::parse(
+            manifest
+                .presence
+                .channel(kind)
+                .and_then(|c| c.str_config("reply_as")),
+        );
+        let heard_audio = mention
+            .attachments
+            .iter()
+            .any(|a| matches!(a, Attachment::Audio { .. }));
+        let outcome = {
+            // The indicator borrows the adapter for exactly the length of
+            // the run, which is also why nothing else may touch the
+            // adapter here — the reply comes after this block.
+            let mut ticket = adapter.typing(&mention.channel, reply_as.wants_voice(heard_audio));
+            let working = std::sync::atomic::AtomicBool::new(true);
+            std::thread::scope(|scope| {
+                if let Some(pulse) = ticket.as_mut() {
+                    scope.spawn(|| {
+                        // Short sleeps so the thread joins promptly when
+                        // the run finishes, rather than holding the reply
+                        // for the rest of an interval.
+                        let mut waited = TYPING_INTERVAL;
+                        while working.load(Ordering::Relaxed) {
+                            if waited >= TYPING_INTERVAL {
+                                pulse.pulse();
+                                waited = std::time::Duration::ZERO;
+                            }
+                            let step = std::time::Duration::from_millis(100);
+                            std::thread::sleep(step);
+                            waited += step;
+                        }
+                    });
+                }
+                let out =
+                    crate::runner::run_task(manifest, agent_dir, custody, handle, &task, &ctx);
+                working.store(false, Ordering::Relaxed);
+                out
+            })
+        };
         if outcome.is_ok() {
             crate::index::schedule_refresh(manifest.clone(), agent_dir.to_path_buf());
         }
@@ -347,16 +418,6 @@ pub fn run_presence(
                         .unwrap_or_default()
                 ));
                 let text: String = out.completion.text.trim().chars().take(4000).collect();
-                let heard_audio = mention
-                    .attachments
-                    .iter()
-                    .any(|a| matches!(a, Attachment::Audio { .. }));
-                let reply_as = ReplyAs::parse(
-                    manifest
-                        .presence
-                        .channel(kind)
-                        .and_then(|c| c.str_config("reply_as")),
-                );
                 let audio = if reply_as.wants_voice(heard_audio) {
                     synthesize_reply(manifest, agent_dir, custody, handle, &text, &mut sink)
                 } else {

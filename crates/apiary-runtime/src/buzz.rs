@@ -90,6 +90,10 @@ impl RecentEventIds {
 /// Buzz stream message kind (NIP-29-style group chat).
 pub const KIND_STREAM_MESSAGE: u16 = 9;
 /// NIP-42 client auth kind.
+/// Buzz's "someone is composing" event. Clients expire it after ~8s, so it
+/// is a heartbeat rather than a state to set and clear.
+pub const KIND_TYPING_INDICATOR: u16 = 20002;
+
 pub const KIND_AUTH: u16 = 22242;
 /// NIP-29 group/channel metadata kind (channel discovery).
 pub const KIND_GROUP_METADATA: u16 = 39000;
@@ -324,6 +328,17 @@ impl<'a> BuzzSession<'a> {
     }
 
     /// Build + sign + post a Buzz stream message to a channel.
+    /// Publish a kind-20002 typing indicator for a channel. Ephemeral and
+    /// short-lived by design: Buzz drops it a few seconds after the last
+    /// one, so an agent that dies mid-run leaves no ghost typing behind.
+    pub fn typing(&mut self, channel_uuid: &str) -> Result<(), crate::Error> {
+        let builder = EventBuilder::new(Kind::Custom(KIND_TYPING_INDICATOR), "")
+            .tag(Tag::custom("h", vec![channel_uuid.to_string()]));
+        let event = self.custody.sign(self.agent, builder)?;
+        self.publish(&event)?;
+        Ok(())
+    }
+
     pub fn post(
         &mut self,
         channel_uuid: &str,
@@ -740,9 +755,35 @@ impl BuzzAdapter<'_> {
     }
 }
 
+/// Typing on Buzz costs one signed ephemeral event on the connection the
+/// listener already holds — no second socket, no second auth.
+struct BuzzTyping<'a, 'b> {
+    session: &'a mut BuzzSession<'b>,
+    channel: String,
+}
+
+impl crate::presence::TypingPulse for BuzzTyping<'_, '_> {
+    fn pulse(&mut self) {
+        // A failed indicator is not worth a word: the reply itself is the
+        // thing that matters, and it is still on its way.
+        let _ = self.session.typing(&self.channel);
+    }
+}
+
 impl crate::presence::ChannelAdapter for BuzzAdapter<'_> {
     fn kind(&self) -> &'static str {
         "buzz"
+    }
+
+    fn typing<'a>(
+        &'a mut self,
+        channel: &str,
+        _voice: bool,
+    ) -> Option<Box<dyn crate::presence::TypingPulse + 'a>> {
+        Some(Box::new(BuzzTyping {
+            session: &mut self.session,
+            channel: channel.to_string(),
+        }))
     }
 
     fn recent_context(&mut self, channel: &str, limit: usize) -> Vec<(String, String)> {
