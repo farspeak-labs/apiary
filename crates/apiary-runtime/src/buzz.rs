@@ -776,6 +776,12 @@ impl crate::presence::ChannelAdapter for BuzzAdapter<'_> {
         stop: &std::sync::atomic::AtomicBool,
     ) -> Result<Option<crate::presence::Mention>, crate::Error> {
         use std::sync::atomic::Ordering;
+        // Before listening, take in any channel opened since we connected.
+        // Rate-limited internally; a failure here is not worth going deaf
+        // over, so it is logged and the existing subscription carries on.
+        if let Err(e) = self.refresh_channels() {
+            eprintln!("buzz: could not refresh channel list: {e}");
+        }
         loop {
             match self
                 .session
