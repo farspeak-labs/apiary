@@ -1738,7 +1738,46 @@ function readinessChecklist(c, m, roster, listener, spend) {
       box.append(go);
     }
   }
-  box.append(help('Buzz membership is separate: an agent must be a relay member to be reachable at all, and a member of a channel to see it. Both are managed in Buzz, not here.'));
+  c.append(box);
+}
+
+// Relay membership was the most common silent failure here: presence
+// configured, agent ratified and active, and it hears nothing because
+// being reachable at all is a grant the relay holds. The panel used to
+// explain that and leave you to go and check. Now it checks, and the fix
+// is in the same place as the finding.
+async function relayReachability(c) {
+  const m = await j(api('/buzz/membership'));
+  if (!m.ok || !m.configured) return;
+  const box = el('div', 'ev');
+  const known = m.member;
+  box.style.borderColor = known ? 'var(--line)' : 'var(--amber)';
+  box.append(el('b', null, known ? 'Reachable on its relay' : 'Not reachable on its relay'));
+  const row = el('div', 'kv');
+  row.append(el('span', 'k', m.relay || 'relay'), el('span', 'v', m.detail || ''));
+  box.append(row);
+  if (!known) {
+    box.append(help('An agent must be a relay member before anyone can reach it. Paste an invite from the relay and it will join using its own key — nothing about your identity is used, and this host stores no relay admin credential.'));
+    const code = el('input');
+    code.placeholder = 'invite code from the relay';
+    const go = el('button', 'btn solid', 'Join relay');
+    const st = el('span', 'meta', '');
+    const row2 = el('div', 'row');
+    row2.append(go, st);
+    box.append(field('Invite', code), row2);
+    go.onclick = async () => {
+      if (!code.value.trim()) { st.textContent = 'Paste an invite code.'; code.focus(); return; }
+      go.disabled = true; st.textContent = 'Claiming the invite as this agent…';
+      const r = await j(api('/buzz/claim-invite'), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ code: code.value.trim() }),
+      });
+      go.disabled = false;
+      if (!r.ok) { st.textContent = r.error || 'The relay refused the invite.'; return; }
+      st.textContent = 'Joined. Re-checking…';
+      render();
+    };
+  }
   c.append(box);
 }
 
@@ -1755,6 +1794,7 @@ async function renderOverview(c) {
   // Approved but not running is one step from working, and that step used to
   // be a button most of a page down inside a presence section. Put it where
   // the state is visible.
+  if (!roster.archived) await relayReachability(c);
   if (d.ratified && !roster.active && !roster.archived) {
     const go = el('div', 'ev');
     go.style.borderColor = 'var(--amber)';

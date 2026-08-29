@@ -493,3 +493,145 @@ pub async fn cancel_errand(
     );
     Json(json!({ "ok": true, "id": cancelled.id })).into_response()
 }
+
+
+// ------------------------------------------------- relay membership
+
+#[derive(serde::Deserialize)]
+pub struct JoinRelayBody {
+    pub code: String,
+}
+
+/// POST /api/agents/{npub}/buzz/claim-invite — the agent claims a relay
+/// invite with its own key. Distinct from `buzz/join`, which joins a
+/// CHANNEL: this is the prior grant that makes the relay answer at all.
+///
+/// Being reachable on a relay is a grant the relay holds, and until now the
+/// only way to add an agent was a shell on the relay's host. That does not
+/// generalize to a relay somebody else runs, and it is the failure people
+/// hit most: presence configured, agent active, hears nothing. Buzz's invite
+/// claim is NIP-98 authenticated and takes the joiner from the signature, so
+/// the agent can join exactly the way a person does — and this host stores
+/// no relay admin credential to do it.
+pub async fn join_relay(
+    AxState(state): AxState<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<JoinRelayBody>,
+) -> impl IntoResponse {
+    let raw_body = serde_json::to_vec(&json!({ "code": body.code })).unwrap_or_default();
+    let (ks, npub, dir, _raw, manifest) = match crate::ops::gate_pub(
+        &state,
+        &headers,
+        "POST",
+        &uri,
+        Some(&raw_body),
+        &npub,
+    ) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let Some(relay) = manifest
+        .presence
+        .channel("buzz")
+        .and_then(|channel| channel.str_config("relay"))
+        .map(str::to_string)
+    else {
+        return crate::err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "this agent has no buzz presence, so there is no relay to join",
+        )
+        .into_response();
+    };
+    let (custody, handle) = match crate::admit_agent(&state, &ks, &npub) {
+        Ok(pair) => pair,
+        Err(error) => {
+            return crate::err(axum::http::StatusCode::BAD_REQUEST, error.to_string())
+                .into_response()
+        }
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        apiary_runtime::buzz::join_relay(&relay, &body.code, &custody, &handle)
+            .map(|response| (relay, response, custody, handle))
+    })
+    .await;
+    let (relay, response, custody, handle) = match outcome {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            return crate::err(axum::http::StatusCode::BAD_GATEWAY, error.to_string())
+                .into_response()
+        }
+        Err(error) => {
+            return crate::err(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                error.to_string(),
+            )
+            .into_response()
+        }
+    };
+    // Joining a relay is a change in who can reach this agent, so it belongs
+    // in the signed record like any other capability change.
+    let _ = EpisodicLog::open(&dir).append(
+        &custody,
+        &handle,
+        Tier::Self_,
+        &EntryBody {
+            action: "buzz.joined".into(),
+            model: None,
+            cost: None,
+            harness: Some("native".into()),
+            outcome: "member".into(),
+            detail: Some(json!({ "relay": relay })),
+        },
+    );
+    Json(json!({ "ok": true, "relay": relay, "response": response })).into_response()
+}
+
+/// GET /api/agents/{npub}/buzz/membership — verify reachability rather
+/// than describing it. Pairs with the join endpoint: this says whether the
+/// grant is missing, that one obtains it.
+pub async fn buzz_membership(
+    AxState(state): AxState<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (ks, npub, _dir, _raw, manifest) =
+        match crate::ops::gate_pub(&state, &headers, "GET", &uri, None, &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let Some(relay) = manifest
+        .presence
+        .channel("buzz")
+        .and_then(|channel| channel.str_config("relay"))
+        .map(str::to_string)
+    else {
+        return Json(json!({ "ok": true, "configured": false })).into_response();
+    };
+    let (custody, handle) = match crate::admit_agent(&state, &ks, &npub) {
+        Ok(pair) => pair,
+        Err(error) => {
+            return Json(json!({
+                "ok": true, "configured": true, "relay": relay,
+                "member": false, "detail": error.to_string(),
+            }))
+            .into_response()
+        }
+    };
+    let relay2 = relay.clone();
+    let checked = tokio::task::spawn_blocking(move || {
+        apiary_runtime::buzz::check_membership(&relay2, &custody, &handle)
+    })
+    .await;
+    let (member, detail) = checked.unwrap_or_else(|e| (false, e.to_string()));
+    Json(json!({
+        "ok": true,
+        "configured": true,
+        "relay": relay,
+        "member": member,
+        "detail": detail,
+    }))
+    .into_response()
+}

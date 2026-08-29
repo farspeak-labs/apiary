@@ -340,6 +340,14 @@ pub fn build_router(state: App) -> Router {
             post(errands::cancel_errand),
         )
         .route(
+            "/api/agents/{npub}/buzz/claim-invite",
+            post(errands::join_relay),
+        )
+        .route(
+            "/api/agents/{npub}/buzz/membership",
+            get(errands::buzz_membership),
+        )
+        .route(
             "/api/agents/{npub}/routines/{name}/run",
             post(routines::run_routine_now),
         )

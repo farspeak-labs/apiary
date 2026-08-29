@@ -755,6 +755,132 @@ impl BuzzAdapter<'_> {
     }
 }
 
+/// Join a relay by claiming an invite, signing as the agent itself.
+///
+/// Relay membership is the most common silent failure in this system: an
+/// agent with correct presence config connects, authenticates, and hears
+/// nothing, because being reachable at all is a separate grant held by the
+/// relay. Adding it used to mean an operator with a shell on the relay
+/// host, which does not generalize to a relay Apiary does not run.
+///
+/// Buzz already has the right primitive. `POST /api/invites/claim` is
+/// NIP-98 authenticated and deliberately exempt from the membership gate —
+/// the joiner is not a member yet, by definition — and it takes the joining
+/// identity from the signature. So the agent joins the way a person does,
+/// holding nothing but its own key. Apiary never stores a relay admin
+/// credential, and this works for a relay on someone else's host.
+pub fn join_relay(
+    relay: &str,
+    code: &str,
+    custody: &Custody,
+    agent: &AgentHandle,
+) -> Result<String, crate::Error> {
+    let base = http_base(relay)?;
+    let url = format!("{base}/api/invites/claim");
+    let body = serde_json::json!({ "code": code.trim() }).to_string();
+    let authorization = nip98_header(&url, "POST", body.as_bytes(), custody, agent)?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| crate::Error::Provider(format!("http client: {e}")))?;
+    let response = client
+        .post(&url)
+        .header(reqwest::header::AUTHORIZATION, authorization)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .map_err(|e| crate::Error::Provider(format!("relay join: {e}")))?;
+    let status = response.status();
+    let text = response.text().unwrap_or_default();
+    if !status.is_success() {
+        // The relay's own words: an expired or spent code and a wrong host
+        // are different problems, and only it knows which.
+        let detail = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v["message"]
+                    .as_str()
+                    .or_else(|| v["error"].as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| text.chars().take(200).collect());
+        return Err(crate::Error::Provider(format!(
+            "relay refused the invite ({status}): {detail}"
+        )));
+    }
+    Ok(text)
+}
+
+/// Ask the relay whether this agent can actually reach it.
+///
+/// The cockpit used to *explain* that relay membership is separate and
+/// leave you to go and check. This checks: connect, authenticate, and try
+/// the cheapest read there is. Confirmed reachable or a reason, never a
+/// guess — a network failure is reported as a network failure rather than
+/// quietly rendered as "not a member".
+pub fn check_membership(relay: &str, custody: &Custody, agent: &AgentHandle) -> (bool, String) {
+    let mut session = match BuzzSession::connect(relay, custody, agent) {
+        Ok(session) => session,
+        Err(error) => return (false, format!("could not reach the relay: {error}")),
+    };
+    match channel_ids(&mut session) {
+        Ok(ids) => (
+            true,
+            format!("reachable — {} channel(s) visible to it", ids.len()),
+        ),
+        Err(error) => (false, error.to_string()),
+    }
+}
+
+/// The HTTPS origin that answers for a `wss://` relay. Scheme mapping
+/// matches the relay's own NIP-98 URL derivation, so the URL we sign is
+/// the URL it verifies.
+fn http_base(relay: &str) -> Result<String, crate::Error> {
+    let trimmed = relay.trim().trim_end_matches('/');
+    let base = if let Some(rest) = trimmed.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        return Err(crate::Error::Provider(format!(
+            "relay url '{relay}' is not ws://, wss://, http:// or https://"
+        )));
+    };
+    Ok(base)
+}
+
+/// A NIP-98 `Authorization: Nostr <base64>` header signed by the agent.
+/// The payload tag is required for POST bodies — without it the relay
+/// accepts the signature and rejects the request.
+fn nip98_header(
+    url: &str,
+    method: &str,
+    body: &[u8],
+    custody: &Custody,
+    agent: &AgentHandle,
+) -> Result<String, crate::Error> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let payload = Sha256::digest(body)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let builder = EventBuilder::new(Kind::Custom(27235), "")
+        .tag(Tag::custom("u", vec![url.to_string()]))
+        .tag(Tag::custom("method", vec![method.to_string()]))
+        .tag(Tag::custom("payload", vec![payload]));
+    let event = custody.sign(agent, builder)?;
+    let json = serde_json::to_string(&event)
+        .map_err(|e| crate::Error::Provider(format!("nip98 encode: {e}")))?;
+    Ok(format!(
+        "Nostr {}",
+        base64::engine::general_purpose::STANDARD.encode(json)
+    ))
+}
+
 /// Typing on Buzz costs one signed ephemeral event on the connection the
 /// listener already holds — no second socket, no second auth.
 struct BuzzTyping<'a, 'b> {
@@ -1005,6 +1131,39 @@ pub fn run_mention_service(
         }
     }
     result
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::http_base;
+
+    /// The URL the agent signs has to be the URL the relay verifies. Buzz
+    /// derives the scheme the same way — wss to https, ws to http — so a
+    /// mismatch here fails as a signature error, which reads like a key
+    /// problem rather than a URL problem.
+    #[test]
+    fn the_signed_origin_matches_how_the_relay_derives_it() {
+        assert_eq!(
+            http_base("wss://buzz.example.com").unwrap(),
+            "https://buzz.example.com"
+        );
+        assert_eq!(
+            http_base("ws://localhost:3084").unwrap(),
+            "http://localhost:3084"
+        );
+        // Trailing slashes would produce a double slash in the signed path.
+        assert_eq!(
+            http_base("wss://buzz.example.com/").unwrap(),
+            "https://buzz.example.com"
+        );
+        // Already-HTTP relay URLs pass through.
+        assert_eq!(
+            http_base("https://buzz.example.com").unwrap(),
+            "https://buzz.example.com"
+        );
+        // Anything else is refused rather than guessed at.
+        assert!(http_base("buzz.example.com").is_err());
+    }
 }
 
 #[cfg(test)]
