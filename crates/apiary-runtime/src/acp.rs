@@ -170,6 +170,10 @@ pub fn run_acp_prompt(
     // inheritance is a separate ratified choice. This is profile isolation,
     // not a filesystem/network sandbox; the manifest and UI say so plainly.
     const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "USER", "SHELL", "LANG", "TMPDIR", "TERM"];
+    // Remembered so a failure can name the exact HOME a login has to happen
+    // in — an isolated harness holds none of the host user's credentials,
+    // and "Authentication required" alone does not say where to fix it.
+    let mut profile_home: Option<std::path::PathBuf> = None;
     let mut cmd = sandboxed_command(command, args, sandbox)?;
     cmd.current_dir(workdir);
     if profile != ProfileMode::Inherit {
@@ -188,11 +192,13 @@ pub fn run_acp_prompt(
                 }
             }
         }
-        let profile_home = profile_root
+        let home = profile_root
             .join(".apiary-harnesses")
             .join(profile_name)
             .join("home");
-        std::fs::create_dir_all(&profile_home)?;
+        std::fs::create_dir_all(&home)?;
+        profile_home = Some(home.clone());
+        let profile_home = home;
         cmd.env("HOME", &profile_home)
             .env("XDG_CONFIG_HOME", profile_home.join(".config"))
             .env("XDG_DATA_HOME", profile_home.join(".local/share"))
@@ -210,18 +216,27 @@ pub fn run_acp_prompt(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| crate::Error::Provider(format!("spawn {command}: {e}")))?;
-    let result = drive(&mut child, workdir, task, mode, turn_timeout);
+    let result = drive(
+        &mut child,
+        workdir,
+        task,
+        mode,
+        turn_timeout,
+        profile_home.as_deref(),
+    );
     let _ = child.kill();
     let _ = child.wait();
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drive(
     child: &mut Child,
     workdir: &std::path::Path,
     task: &str,
     mode: PermissionMode,
     turn_timeout: Duration,
+    profile_home: Option<&std::path::Path>,
 ) -> Result<AcpOutcome, crate::Error> {
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
@@ -269,6 +284,7 @@ fn drive(
         json!({"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}}}),
     )?;
     let mut session_id: Option<String> = None;
+    let mut auth_hint: Option<String> = None;
     let mut new_id: Option<i64> = None;
     let mut prompt_id: Option<i64> = None;
 
@@ -365,12 +381,44 @@ fn drive(
         // RESPONSE to one of our requests.
         if let Some(id) = msg.get("id").and_then(|i| i.as_i64()) {
             if let Some(err) = msg.get("error") {
+                let message = err["message"].as_str().unwrap_or("unknown");
+                // An unauthenticated harness is the most common first
+                // failure and the least self-explanatory: the loop is
+                // installed, the handshake succeeded, and it stops because
+                // it has no login — in a HOME the operator has never seen.
+                let remedy = if message.to_ascii_lowercase().contains("auth") {
+                    match profile_home {
+                        // Quote the harness's own instruction rather than
+                        // guessing a command: the binary Apiary spawns is
+                        // often an adapter, not the thing you log in to.
+                        Some(home) => format!(
+                            " — this harness runs in its own profile and has no login yet. \
+                             Log it in as a person, with HOME={} set{}",
+                            home.display(),
+                            auth_hint
+                                .as_deref()
+                                .map(|hint| format!(" ({hint})"))
+                                .unwrap_or_default()
+                        ),
+                        None => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
                 return Err(crate::Error::Provider(format!(
-                    "acp error on request {id}: {}",
-                    err["message"].as_str().unwrap_or("unknown")
+                    "acp error on request {id}: {message}{remedy}"
                 )));
             }
             if id == init_id {
+                auth_hint = msg["result"]["authMethods"]
+                    .as_array()
+                    .and_then(|methods| methods.first())
+                    .and_then(|method| {
+                        method["description"]
+                            .as_str()
+                            .or_else(|| method["name"].as_str())
+                    })
+                    .map(str::to_string);
                 // The session's working directory is the AGENT's dir — the
                 // harness works in the agent's world, not the invoking
                 // shell's. (v1 shipped env::current_dir() here; a live run
