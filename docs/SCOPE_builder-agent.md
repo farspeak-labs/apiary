@@ -23,7 +23,15 @@ The builder never changes anything that is running. It produces **branches and p
    watch)         governed)        sandboxed)    ran)
 ```
 
-**Working copy.** A dedicated clone (`~/builder/apiary`), granted as the harness `workdir`, with `sandbox: no-network` so a coding loop cannot reach the relay, the keystore, or the internet mid-edit. The deployed tree and `~/.apiary` are not reachable from it. The builder is an ordinary contributor with a checkout, not an operator with a shell.
+**Working copy.** A dedicated clone (`~/builder/apiary`), granted as the harness `workdir`. The builder is an ordinary contributor with a checkout, not an operator with a shell.
+
+**Correction, found while building this.** An earlier draft said `sandbox: no-network`, "so a coding loop cannot reach the relay, the keystore, or the internet mid-edit". That is not available: the sandbox profile is `(deny network*)` applied to the whole harness process, and a coding harness that cannot reach a model cannot run at all. `read-only` is equally out — the builder's entire job is writing files. So the coding harness runs with `sandbox: none`, and the isolation that actually holds is:
+
+- **`profile: isolated`** — a per-agent `HOME` under `.apiary-harnesses/`, so the host user's credentials, global agents, and extensions are not in scope. The builder logs its harness in once, into its own profile, and that login is its own.
+- **No key material anywhere near it.** Custody never enters a harness environment; `~/.apiary` is not its workdir and its secrets are not in its env. It has network but nothing worth sending.
+- **The clone, the merge gate, and no deploy** — the three that were doing the real work all along.
+
+Worth being blunt about the residual: a coding loop with network and file-write in a checkout can, in principle, reach the internet. What stops that from mattering is that it holds no secret and its output is reviewed before it runs anywhere. If that stops being enough, the fix is a network sandbox with an allowlist for the model endpoint, which the current profiles cannot express.
 
 **Where work comes from.** Two sources, both narrow:
 
@@ -55,7 +63,9 @@ It will be autonomous in the loop and supervised at the boundary — the same tr
 
 I do not think that is a compromise on the goal. The bottleneck in improving Apiary is not typing; it is knowing which change is worth making and whether it worked. An agent that reliably turns "this failed eleven times last week" into a tested branch with an argument attached is doing the part that is actually slow.
 ## Build order
-1. **The working copy and the grant.** Clone, `harnesses` entry with `workdir` + `no-network` sandbox, curated permission mode, `tokens_per_day: 1_000_000` with a hard per-branch ceiling, and a Buzz DM target for the alarm. Prove it can read the tree and run `cargo test` with the exit code landing in the log.
+1. **The working copy and the grant.** Clone, `harnesses` entry with `workdir`, `profile: isolated`, curated permission mode, `tokens_per_day: 1_000_000` with a hard per-branch ceiling, and a Buzz DM target for the alarm. Prove it can read the tree and run `cargo test` with the exit code landing in the log.
+
+   Three prerequisites the host does not have yet, all named here because each is a decision rather than a chore: an **ACP coding harness** (only Goose is discovered today; Claude Code is an inference provider here, deliberately tool-less, so using it as the loop means an ACP adapter), a **Rust toolchain** on the host that will run the tests, and the harness's **own login** in its isolated profile.
   
 2. **One human-filed change, end to end, on Apiary.** Ask it in the channel for something small and real; get a branch and a PR back through an errand. This is the whole loop, and it either works or it does not.
   
