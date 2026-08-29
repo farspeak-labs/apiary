@@ -293,3 +293,42 @@ governance:
     assert!(manifest("").unwrap().routing.harness.is_none());
     assert!(manifest(granted).unwrap().routing.harness.is_none());
 }
+
+/// A coding preset is only correct as a set: the harness grant alone sits
+/// unused, and `routing.harness` alone names something that was never
+/// granted. Both, or the agent is founded broken in a way that only shows
+/// up when someone talks to it.
+#[test]
+fn a_coding_shape_is_valid_only_with_both_halves() {
+    let manifest = |extra: &str| {
+        Manifest::from_yaml(&format!(
+            r#"
+manifest_version: 1
+identity:
+  npub: npub1m8mfxnr32mlkylq9s0cj5l6vheatdu39kaze26e65ptzfr8vudgse6kgv3
+inference:
+  - name: brain
+    provider: mock
+routing:
+  default: brain
+{extra}
+memory:
+  log: local
+governance:
+  suspend_keys:
+    - npub1kpmddremcthyftcuua6hjkt9hekc729j78qkhfgfvv35efjz0mnsgddfeg
+"#
+        ))
+    };
+    let grant = "harnesses:\n  - name: coder\n    command: /usr/local/bin/claude-code-acp\n    profile: isolated\n    sandbox: none\n    workdir: /tmp/checkout\n";
+
+    let whole = manifest(&format!("  harness: coder\n{grant}")).expect("both halves validate");
+    assert_eq!(whole.routing.harness.as_deref(), Some("coder"));
+    assert_eq!(whole.harnesses[0].workdir.as_deref(), Some("/tmp/checkout"));
+
+    // The grant on its own is legal but inert — nothing routes to it.
+    assert!(manifest(grant).unwrap().routing.harness.is_none());
+
+    // The routing line on its own is refused outright.
+    assert!(manifest("  harness: coder\n").is_err());
+}

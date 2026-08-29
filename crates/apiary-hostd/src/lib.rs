@@ -1006,6 +1006,13 @@ struct FoundBody {
     /// missing credentials) falls back to the conservative template.
     #[serde(default)]
     draft_with: Option<String>,
+    /// The shape of agent: "assistant" (default), "coding", or "watcher".
+    /// Carries the settings that only work as a set.
+    #[serde(default)]
+    preset: Option<String>,
+    /// Where a coding agent's checkout, or a watcher's folder, lives.
+    #[serde(default)]
+    workdir: Option<String>,
 }
 
 /// The founding flow (SPEC §12.5, generative-UI-first): generate identity,
@@ -1066,6 +1073,17 @@ async fn found_agent(
             return e.into_response();
         }
     }
+    // A shape only applies when the host can actually back it: a coding
+    // preset with no harness on this machine would write a command that is
+    // not there, which is the failure mode presets exist to remove.
+    let discovered = ops::discovered_harness_for_preset();
+    let preset = Preset::parse(
+        body.preset.as_deref(),
+        body.workdir.as_deref(),
+        discovered
+            .as_ref()
+            .map(|(command, args)| (command.as_str(), args.as_slice())),
+    );
     match create_agent(
         &state,
         &body.name,
@@ -1073,6 +1091,7 @@ async fn found_agent(
         &suspend,
         body.draft_with.as_deref(),
         None,
+        preset.as_ref(),
     )
     .await
     {
@@ -1108,6 +1127,7 @@ pub(crate) async fn create_agent(
     suspend: &[String],
     draft_with: Option<&str>,
     shape: Option<&apiary_runtime::proposal::FoundingRequest>,
+    preset: Option<&Preset>,
 ) -> Result<(String, String, String), (StatusCode, String)> {
     let pass = state.passphrase_clone().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1166,6 +1186,9 @@ pub(crate) async fn create_agent(
         }
         drafted_by = format!("the founding request {} filed", shape.by);
     }
+    if let Some(preset) = preset {
+        preset.apply(&mut manifest);
+    }
     let yaml = manifest
         .to_yaml()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1175,6 +1198,116 @@ pub(crate) async fn create_agent(
     std::fs::write(dir.join("name"), name)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok((npub, yaml, drafted_by))
+}
+
+/// A shape of agent, applied to the drafted manifest as a unit.
+///
+/// The hard part of founding a working agent was never typing — it was
+/// knowing that a coding agent needs a harness grant AND `routing.harness`
+/// AND a proactive allowance AND a workdir that is not the deployed tree,
+/// and that a watcher without `proactive_tokens_per_day` is inert. Those
+/// facts live in scope docs and in whoever founded the last one. A preset
+/// carries them together, so the pieces that only work as a set arrive as
+/// a set.
+///
+/// A preset never invents a capability the host cannot back: no discovered
+/// harness means no harness grant, and the cockpit says so rather than
+/// writing a command that is not there.
+#[derive(Debug, Clone)]
+pub(crate) enum Preset {
+    /// Answers people. The default shape, and the template already is one.
+    Assistant,
+    /// Works on code in a checkout, through a real coding loop.
+    Coding {
+        harness_command: String,
+        harness_args: Vec<String>,
+        workdir: String,
+    },
+    /// Acts on change rather than on being asked.
+    Watcher { vault: String, path: String },
+}
+
+impl Preset {
+    pub(crate) fn parse(
+        name: Option<&str>,
+        workdir: Option<&str>,
+        harness: Option<(&str, &[String])>,
+    ) -> Option<Self> {
+        match name.map(str::trim).unwrap_or("") {
+            "coding" => {
+                let (command, args) = harness?;
+                Some(Preset::Coding {
+                    harness_command: command.to_string(),
+                    harness_args: args.to_vec(),
+                    workdir: workdir?.trim().to_string(),
+                })
+            }
+            "watcher" => Some(Preset::Watcher {
+                vault: "Watched".into(),
+                path: workdir?.trim().to_string(),
+            }),
+            "assistant" => Some(Preset::Assistant),
+            _ => None,
+        }
+    }
+
+    fn apply(&self, manifest: &mut Manifest) {
+        match self {
+            Preset::Assistant => {}
+            Preset::Coding {
+                harness_command,
+                harness_args,
+                workdir,
+            } => {
+                manifest.harnesses.push(apiary_core::manifest::HarnessGrant {
+                    name: "coder".into(),
+                    kind: "acp".into(),
+                    command: harness_command.clone(),
+                    args: harness_args.clone(),
+                    access: apiary_core::manifest::HarnessAccess::Full,
+                    // Its own HOME, so the host user's credentials are not
+                    // in scope. It needs its own login — the readiness panel
+                    // says so, because nothing else would.
+                    profile: apiary_core::manifest::HarnessProfile::Isolated,
+                    // NOT no-network: that profile denies the whole process,
+                    // and a loop that cannot reach a model cannot run.
+                    sandbox: apiary_core::manifest::HarnessSandbox::None,
+                    allowed_tools: Vec::new(),
+                    inherit_env: Vec::new(),
+                    metering: apiary_core::manifest::HarnessMetering::Estimated,
+                    estimated_tokens_per_run: Some(60_000),
+                    workdir: Some(workdir.clone()),
+                });
+                // Pointing work at it is a separate line, and without it the
+                // grant sits unused — the exact gap that made the first
+                // builder agent unreachable by conversation.
+                manifest.routing.harness = Some("coder".into());
+                // Coding runs are long; the fence that matters is per-run.
+                manifest
+                    .governance
+                    .budgets
+                    .insert("tokens_per_day".into(), json!(1_000_000));
+                manifest
+                    .governance
+                    .budgets
+                    .insert("proactive_tokens_per_day".into(), json!(200_000));
+            }
+            Preset::Watcher { vault, path } => {
+                manifest.memory.vaults.push(apiary_core::manifest::VaultRef {
+                    name: vault.clone(),
+                    path: path.clone(),
+                    kind: None,
+                });
+                // A watch with no proactive allowance is inert, and says so
+                // only on an endpoint nobody visits.
+                manifest
+                    .governance
+                    .budgets
+                    .entry("proactive_tokens_per_day".into())
+                    .or_insert(json!(40_000));
+            }
+        }
+    }
 }
 
 /// The inference slot a NEW agent starts with.

@@ -4532,6 +4532,33 @@ function renderFound(c) {
   if (!people.length) {
     const option = el('option', null, 'No local approval identity'); option.value = ''; fSuspend.append(option);
   }
+  // The settings that only work as a set. Knowing a coding agent needs a
+  // harness grant AND routing.harness AND a proactive allowance AND a
+  // checkout that is not the deployed tree was, until now, something you
+  // learned by founding one wrong.
+  const fShape = el('select');
+  for (const [value, label] of [
+    ['assistant', 'General assistant — answers people'],
+    ['coding', 'Coding agent — works in a checkout through a real coding loop'],
+    ['watcher', 'Watcher — acts when something changes'],
+  ]) {
+    const option = el('option', null, label); option.value = value; fShape.append(option);
+  }
+  const fWorkdir = el('input');
+  fWorkdir.placeholder = '/absolute/path';
+  const workdirField = field('Working directory', fWorkdir,
+    'A checkout it may edit — never the tree this host runs from.');
+  workdirField.hidden = true;
+  fShape.onchange = () => {
+    const needsPath = fShape.value === 'coding' || fShape.value === 'watcher';
+    workdirField.hidden = !needsPath;
+    const hint = workdirField.querySelector('small');
+    if (hint) {
+      hint.textContent = fShape.value === 'coding'
+        ? 'A checkout it may edit — never the tree this host runs from.'
+        : 'The folder it watches for changes.';
+    }
+  };
   const fDraft = el('input'); fDraft.type = 'checkbox'; fDraft.style.width = 'auto';
   fDraft.checked = !!hostStatus.anthropic_key_present;
   fDraft.disabled = !hostStatus.anthropic_key_present;
@@ -4540,6 +4567,8 @@ function renderFound(c) {
   const st = el('span', 'meta', '');
   const r4 = el('div', 'row'); r4.append(draftLabel, go, st);
   sec.append(field('Agent name', fName), field('Purpose', fPurpose),
+    field('Shape', fShape, 'Presets carry the settings that only work together. You review everything before approving.'),
+    workdirField,
     field('Managed by', fSuspend, people.length
       ? 'Choose one or more people. Each selected person can independently approve or stop this agent.'
       : 'Create an approval identity or add an external Nostr ID under People & access.'),
@@ -4552,10 +4581,15 @@ function renderFound(c) {
     if (!fPurpose.value.trim()) { st.textContent = 'Describe the agent’s purpose.'; fPurpose.focus(); return; }
     const selectedManagers = [...fSuspend.selectedOptions].map(option => option.value).filter(Boolean);
     if (!selectedManagers.length) { st.textContent = 'Choose at least one manager.'; fSuspend.focus(); return; }
+    if (fShape.value !== 'assistant' && !fWorkdir.value.trim()) {
+      st.textContent = 'This shape needs a directory.'; fWorkdir.focus(); return;
+    }
     go.disabled = true; st.textContent = 'Creating the identity and draft configuration…';
     const r = await j('/api/agents/found', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
+        preset: fShape.value,
+        workdir: fWorkdir.value.trim() || undefined,
         name: fName.value.trim(),
         purpose: fPurpose.value.trim(),
         suspend_keys: selectedManagers,

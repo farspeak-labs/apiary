@@ -1048,15 +1048,30 @@ fn discover_acp_harnesses_from(
             for (binary, id, name) in [
                 ("goose", "goose", "Goose harness"),
                 ("goosed", "goose-daemon", "Goose harness"),
+                // The adapter that speaks ACP on Claude Code's behalf.
+                // Claude Code itself is an inference provider here and is
+                // deliberately tool-less, so the adapter is the harness.
+                (
+                    "claude-code-acp",
+                    "claude-code-acp",
+                    "Claude Code harness",
+                ),
             ] {
                 let candidate = directory.join(binary);
                 if executable(&candidate) && seen.insert(candidate.clone()) {
+                    let adapter = binary == "claude-code-acp";
                     found.push(DiscoveredHarness {
                         id,
                         name,
-                        description: "Installed Goose ACP loop; Apiary still governs its profile, tools, sandbox, and accounting.",
+                        description: if adapter {
+                            "Claude Code driven over ACP; Apiary still governs its profile, tools, sandbox, and accounting."
+                        } else {
+                            "Installed Goose ACP loop; Apiary still governs its profile, tools, sandbox, and accounting."
+                        },
                         command: candidate.to_string_lossy().into_owned(),
-                        args: vec!["acp"],
+                        // Goose needs a subcommand to speak ACP; the adapter
+                        // speaks it on stdio with none.
+                        args: if adapter { Vec::new() } else { vec!["acp"] },
                         source: "PATH",
                     });
                 }
@@ -1064,6 +1079,18 @@ fn discover_acp_harnesses_from(
         }
     }
     found
+}
+
+/// The harness a preset should grant, if this host has one at all.
+/// Returns the command and its ACP arguments, or None — a preset must
+/// never write a command that is not on the machine.
+pub(crate) fn discovered_harness_for_preset() -> Option<(String, Vec<String>)> {
+    discover_acp_harnesses().into_iter().next().map(|h| {
+        (
+            h.command,
+            h.args.into_iter().map(str::to_string).collect::<Vec<_>>(),
+        )
+    })
 }
 
 fn discover_acp_harnesses() -> Vec<DiscoveredHarness> {
