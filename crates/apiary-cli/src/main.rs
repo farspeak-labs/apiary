@@ -320,6 +320,20 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                     apiary_core::identity::parse_npub(k)?;
                 }
                 let passphrase = require_passphrase(cli)?;
+                // Check the passphrase against the WORKSPACE before minting a
+                // key with it. Storing first happily produced an agent whose
+                // key no other part of this host could open: it founded, it
+                // took a manifest, it appeared in the cockpit, and it could
+                // never be ratified — the failure surfaced only at the
+                // approval button, in the one place it reads as the ratify
+                // being broken rather than the founding.
+                ks.verify_or_initialize_workspace(passphrase).map_err(|e| {
+                    let detail = e.to_string();
+                    let detail = detail.strip_prefix("keystore: ").unwrap_or(&detail).to_string();
+                    apiary_core::Error::Keystore(format!(
+                        "{detail} — founding with it would create an agent this host cannot open, unlock, or ratify"
+                    ))
+                })?;
                 let keys = apiary_core::identity::generate();
                 let npub = apiary_core::identity::to_npub(&keys.public_key())?;
                 let key_path = ks.store(&keys, passphrase)?;
