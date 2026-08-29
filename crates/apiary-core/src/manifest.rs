@@ -500,6 +500,15 @@ pub struct Routing {
     /// action has been emitted. An empty map means fail closed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fallbacks: BTreeMap<String, Vec<String>>,
+    /// Which granted harness does WORK — the runs that produce something
+    /// rather than answer someone. Errands use it; a mention never does,
+    /// because answering "hi" by starting a coding loop in a repository is
+    /// both wrong and expensive.
+    ///
+    /// The host chooses this, not the model: it is a ratified line in the
+    /// manifest, so an agent cannot elect to run itself on a harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1149,6 +1158,15 @@ impl Manifest {
             if !slot_names.contains(&d.as_str()) {
                 return Err(crate::Error::Manifest(format!(
                     "routing default targets unknown inference slot '{d}'"
+                )));
+            }
+        }
+        if let Some(h) = &self.routing.harness {
+            if !self.harnesses.iter().any(|grant| grant.name == *h) {
+                return Err(crate::Error::Manifest(format!(
+                    "routing harness names '{h}', which is not a granted harness — a harness \
+                     is a capability, and routing can only point at one that was \
+                     already approved"
                 )));
             }
         }

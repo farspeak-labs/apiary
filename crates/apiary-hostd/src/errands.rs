@@ -172,6 +172,11 @@ fn run_errand(state: &App, npub: &str, manifest: &Manifest, dir: &std::path::Pat
         // Responsive: a person asked for this. The bound comes from the
         // per-errand ceiling and the pending cap, not from the lane.
         lane: apiary_runtime::spend::Lane::Responsive,
+        // An agent whose manifest names a work harness does its errands
+        // there. This is what lets "ask in the channel, get a branch back"
+        // work: the mention is answered by the native loop, and the work
+        // it took on runs in a real coding loop afterwards.
+        harness: manifest.routing.harness.clone(),
         errand_door: Some(apiary_runtime::errands::Door {
             agent_dir: dir.to_path_buf(),
             channel_kind: errand.channel_kind.clone(),

@@ -127,6 +127,45 @@ pub fn run_task_observed(
             f(e)
         }
     };
+    // Work that needs a real coding loop goes to a granted harness instead
+    // of the native one. Both paths carry the same governance shell — the
+    // harness path reserves, logs, and settles inside run_acp_task — so
+    // delegating here, before this function reserves anything, keeps
+    // exactly one budget claim per run.
+    if let Some(name) = ctx.harness.clone() {
+        if !ctx.lightweight {
+            let grant = manifest
+                .harnesses
+                .iter()
+                .find(|grant| grant.name == name)
+                .ok_or_else(|| {
+                    crate::Error::Provider(format!(
+                        "this run was routed to harness '{name}', which this agent has \
+                         not been granted"
+                    ))
+                })?
+                .clone();
+            let out = run_acp_task(manifest, agent_dir, custody, agent, task, &grant)?;
+            return Ok(RunOutcome {
+                completion: Completion {
+                    text: out.text,
+                    // The harness picks its own model and does not tell us
+                    // which; naming the harness is the honest attribution.
+                    model: format!("harness:{name}"),
+                    outcome: out.stop_reason,
+                    // Metering belongs to the grant, and run_acp_task has
+                    // already settled it against the ledger.
+                    input_tokens: 0,
+                    output_tokens: 0,
+                },
+                slot: name,
+                log_event_id: out.log_event_id,
+                timings: out.timings,
+                // It ran tools, so something happened in the world.
+                acted: !out.tool_calls.is_empty(),
+            });
+        }
+    }
     let log = EpisodicLog::open(agent_dir);
     let ledger = SpendLedger::open(agent_dir);
 

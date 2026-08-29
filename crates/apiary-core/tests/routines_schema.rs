@@ -251,3 +251,45 @@ governance:
         .expect_err("a home must name somewhere");
     assert!(error.to_string().contains("needs a vault or a connector"), "{error}");
 }
+
+/// A harness is a capability. Routing can point work at one, but pointing
+/// is not granting — otherwise a line in `routing` would hand an agent a
+/// coding loop that was never approved as a capability.
+#[test]
+fn routing_can_only_send_work_to_a_harness_that_was_granted() {
+    let manifest = |extra: &str| {
+        Manifest::from_yaml(&format!(
+            r#"
+manifest_version: 1
+identity:
+  npub: npub1m8mfxnr32mlkylq9s0cj5l6vheatdu39kaze26e65ptzfr8vudgse6kgv3
+inference:
+  - name: brain
+    provider: mock
+routing:
+  default: brain
+{extra}
+memory:
+  log: local
+governance:
+  suspend_keys:
+    - npub1kpmddremcthyftcuua6hjkt9hekc729j78qkhfgfvv35efjz0mnsgddfeg
+"#
+        ))
+    };
+
+    let granted = "harnesses:\n  - name: coder\n    command: /usr/local/bin/claude-code-acp\n";
+
+    // Granted, and pointed at: fine.
+    let ok = manifest(&format!("  harness: coder\n{granted}")).expect("a granted harness routes");
+    assert_eq!(ok.routing.harness.as_deref(), Some("coder"));
+
+    // Pointed at without the grant: refused, and it says why.
+    let error = manifest("  harness: coder\n").expect_err("routing cannot invent a capability");
+    assert!(error.to_string().contains("not a granted harness"), "{error}");
+
+    // Absent is the normal case — most agents have no harness at all, and
+    // their work runs on the native loop.
+    assert!(manifest("").unwrap().routing.harness.is_none());
+    assert!(manifest(granted).unwrap().routing.harness.is_none());
+}

@@ -160,3 +160,61 @@ fn strict_unknown_usage_refuses_before_spawning() {
     assert_eq!(EpisodicLog::open(&dir).verify().unwrap(), 1);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The wiring that makes a builder reachable by talking to it: an ordinary
+/// governed run, told which harness to use, goes there instead of the
+/// native inference loop. Everything else about the run is unchanged.
+#[test]
+fn a_governed_run_can_be_routed_to_a_granted_harness() {
+    let (mut manifest, dir, custody, handle) = setup("routed");
+    let mock = env!("CARGO_BIN_EXE_mock-acp-agent");
+    let grant = grant(mock, HarnessAccess::Full);
+    manifest.harnesses.push(grant.clone());
+    manifest.routing.harness = Some(grant.name.clone());
+
+    let ctx = apiary_runtime::routing::TaskContext {
+        harness: manifest.routing.harness.clone(),
+        ..Default::default()
+    };
+    let out = apiary_runtime::runner::run_task(
+        &manifest,
+        &dir,
+        &custody,
+        &handle,
+        "build the thing",
+        &ctx,
+    )
+    .expect("a routed run reaches the harness");
+
+    assert!(
+        out.completion.text.contains("mock harness reply: build the thing"),
+        "{}",
+        out.completion.text
+    );
+    // Attribution is honest: the harness picks its own model, so the record
+    // names the harness rather than inventing a model.
+    assert_eq!(out.completion.model, "harness:mock-acp");
+    assert_eq!(out.slot, "mock-acp");
+    // This manifest has NO inference slots at all, so reaching the harness
+    // proves the delegation happens before the native path is consulted.
+    assert!(manifest.inference.is_empty());
+}
+
+/// Routing is not a grant. A run pointed at a harness the agent does not
+/// hold is refused rather than quietly falling back to the native loop —
+/// falling back would silently answer a coding request with prose.
+#[test]
+fn a_run_routed_to_an_ungranted_harness_is_refused() {
+    let (manifest, dir, custody, handle) = setup("ungranted");
+    let ctx = apiary_runtime::routing::TaskContext {
+        harness: Some("not-granted".into()),
+        ..Default::default()
+    };
+    let result =
+        apiary_runtime::runner::run_task(&manifest, &dir, &custody, &handle, "build it", &ctx);
+    let error = match result {
+        Ok(_) => panic!("an ungranted harness must refuse"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("has not been granted"), "{error}");
+}

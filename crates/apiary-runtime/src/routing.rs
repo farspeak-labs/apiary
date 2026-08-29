@@ -36,6 +36,10 @@ pub struct TaskContext {
     /// intentions) draw on the proactive sub-lane; everything a person or
     /// a ratified schedule asked for stays responsive.
     pub lane: crate::spend::Lane,
+    /// Run this task through a granted harness instead of the native
+    /// inference loop. Set by the host from `routing.harness` for work
+    /// runs; never by the model, and never for a mention.
+    pub harness: Option<String>,
     /// Set only when a person opened this run and is waiting on it. It is
     /// what makes `follow_up` available, so an errand cannot file an
     /// errand and a schedule cannot authorize itself more work.
