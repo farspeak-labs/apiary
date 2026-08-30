@@ -361,43 +361,6 @@ impl crate::connector::Connector for ProposeAgent {
     }
 }
 
-#[cfg(test)]
-mod founding_tests {
-    use super::*;
-
-    #[test]
-    fn founding_request_round_trips_and_validates() {
-        let dir = std::env::temp_dir().join(format!("apiary-founding-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(read_founding_request(&dir).is_none());
-        let request = FoundingRequest {
-            name: "Docs gardener".into(),
-            purpose: "keep the docs pruned".into(),
-            role: "tends documentation".into(),
-            principles: vec!["small commits".into()],
-            boundaries: vec![],
-            skills: vec!["markdown hygiene".into()],
-            connectors: vec!["markdown-vault".into()],
-            tokens_per_day: Some(50_000),
-            reason: "the humans keep forgetting".into(),
-            at: "2026-08-22T00:00:00Z".into(),
-            by: "npub1example".into(),
-        };
-        write_founding_request(&dir, &request).unwrap();
-        let back = read_founding_request(&dir).expect("pending request reads back");
-        assert_eq!(back.name, "Docs gardener");
-        assert_eq!(back.tokens_per_day, Some(50_000));
-        assert_eq!(back.boundaries, Vec::<String>::new());
-        // Missing essentials are refused at write time.
-        let mut invalid = request.clone();
-        invalid.reason = "  ".into();
-        assert!(write_founding_request(&dir, &invalid).is_err());
-        clear_founding_request(&dir);
-        assert!(read_founding_request(&dir).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 /// `propose_amendment` — the whole manifest as YAML; advanced.
 pub struct ProposeAmendment {
     pub agent_dir: PathBuf,
@@ -447,5 +410,42 @@ impl crate::connector::Connector for ProposeAmendment {
             },
         )?;
         Ok("proposal written — waiting for the governor to accept and ratify.".into())
+    }
+}
+
+#[cfg(test)]
+mod founding_tests {
+    use super::*;
+
+    #[test]
+    fn founding_request_round_trips_and_validates() {
+        let dir = std::env::temp_dir().join(format!("apiary-founding-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(read_founding_request(&dir).is_none());
+        let request = FoundingRequest {
+            name: "Docs gardener".into(),
+            purpose: "keep the docs pruned".into(),
+            role: "tends documentation".into(),
+            principles: vec!["small commits".into()],
+            boundaries: vec![],
+            skills: vec!["markdown hygiene".into()],
+            connectors: vec!["markdown-vault".into()],
+            tokens_per_day: Some(50_000),
+            reason: "the humans keep forgetting".into(),
+            at: "2026-08-22T00:00:00Z".into(),
+            by: "npub1example".into(),
+        };
+        write_founding_request(&dir, &request).unwrap();
+        let back = read_founding_request(&dir).expect("pending request reads back");
+        assert_eq!(back.name, "Docs gardener");
+        assert_eq!(back.tokens_per_day, Some(50_000));
+        assert_eq!(back.boundaries, Vec::<String>::new());
+        // Missing essentials are refused at write time.
+        let mut invalid = request.clone();
+        invalid.reason = "  ".into();
+        assert!(write_founding_request(&dir, &invalid).is_err());
+        clear_founding_request(&dir);
+        assert!(read_founding_request(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -182,11 +182,7 @@ pub trait ChannelAdapter {
     ///
     /// Default: none. A platform with no such affordance is quiet, not
     /// broken.
-    fn typing<'a>(
-        &'a mut self,
-        _channel: &str,
-        _voice: bool,
-    ) -> Option<Box<dyn TypingPulse + 'a>> {
+    fn typing<'a>(&'a mut self, _channel: &str, _voice: bool) -> Option<Box<dyn TypingPulse + 'a>> {
         None
     }
 }
@@ -308,9 +304,7 @@ pub fn run_presence(
         } else {
             let lines = history
                 .iter()
-                .map(|(who, what)| {
-                    format!("{who}: {}", what.chars().take(600).collect::<String>())
-                })
+                .map(|(who, what)| format!("{who}: {}", what.chars().take(600).collect::<String>()))
                 .collect::<Vec<_>>()
                 .join("\n");
             format!(
@@ -606,7 +600,6 @@ pub fn attachment_framing(attachments: &[Attachment]) -> String {
 mod tests {
     use super::*;
 
-
     /// The words people say are a grant, not a default. A log that is signed,
     /// portable, and sometimes published must not quietly become a transcript
     /// of other people's talk.
@@ -615,8 +608,9 @@ mod tests {
         let base = "manifest_version: 1\nidentity:\n  npub: npub1m8mfxnr32mlkylq9s0cj5l6vheatdu39kaze26e65ptzfr8vudgse6kgv3\n\
              inference:\n  - name: brain\n    provider: mock\nrouting:\n  default: brain\n\
              governance:\n  suspend_keys:\n    - npub1kpmddremcthyftcuua6hjkt9hekc729j78qkhfgfvv35efjz0mnsgddfeg\n";
-        let off = apiary_core::manifest::Manifest::from_yaml(&format!("{base}memory:\n  log: local\n"))
-            .expect("valid manifest");
+        let off =
+            apiary_core::manifest::Manifest::from_yaml(&format!("{base}memory:\n  log: local\n"))
+                .expect("valid manifest");
         assert!(
             !off.memory.remember_conversations,
             "forgetting is the default"
@@ -628,11 +622,12 @@ mod tests {
         assert!(on.memory.remember_conversations);
         // The gate is the manifest flag, so the detail body carries the words
         // only in the second case.
-        let words = |remember: bool| {
-            serde_json::json!({ "text": remember.then(|| "what was said".to_string()) })
-        };
+        let words = |remember: bool| serde_json::json!({ "text": remember.then(|| "what was said".to_string()) });
         assert!(words(off.memory.remember_conversations)["text"].is_null());
-        assert_eq!(words(on.memory.remember_conversations)["text"], "what was said");
+        assert_eq!(
+            words(on.memory.remember_conversations)["text"],
+            "what was said"
+        );
     }
 
     #[test]

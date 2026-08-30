@@ -187,7 +187,9 @@ fn a_governed_run_can_be_routed_to_a_granted_harness() {
     .expect("a routed run reaches the harness");
 
     assert!(
-        out.completion.text.contains("mock harness reply: build the thing"),
+        out.completion
+            .text
+            .contains("mock harness reply: build the thing"),
         "{}",
         out.completion.text
     );
@@ -216,5 +218,8 @@ fn a_run_routed_to_an_ungranted_harness_is_refused() {
         Ok(_) => panic!("an ungranted harness must refuse"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("has not been granted"), "{error}");
+    assert!(
+        error.to_string().contains("has not been granted"),
+        "{error}"
+    );
 }

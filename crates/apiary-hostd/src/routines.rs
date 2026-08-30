@@ -688,7 +688,9 @@ pub async fn get_founding_proposal(
             Err(e) => return e.into_response(),
         };
     match apiary_runtime::proposal::read_founding_request(&dir) {
-        Some(request) => Json(json!({"ok": true, "pending": true, "request": request})).into_response(),
+        Some(request) => {
+            Json(json!({"ok": true, "pending": true, "request": request})).into_response()
+        }
         None => Json(json!({"ok": true, "pending": false})).into_response(),
     }
 }

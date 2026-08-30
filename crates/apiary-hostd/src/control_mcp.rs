@@ -589,7 +589,10 @@ mod tests {
             AutonomyNeed::OpenCredentials,
         ] {
             let denied = autonomy_permits(&state, None, need).unwrap_err();
-            assert!(denied.1.contains("human door"), "explains itself: {denied:?}");
+            assert!(
+                denied.1.contains("human door"),
+                "explains itself: {denied:?}"
+            );
         }
     }
 

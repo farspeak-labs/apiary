@@ -330,8 +330,9 @@ impl crate::connector::Connector for FollowUp {
         };
         let id = errand.id.clone();
         state.errands.push(errand);
-        file.save(&state)
-            .map_err(|error| crate::Error::Provider(format!("could not file the errand: {error}")))?;
+        file.save(&state).map_err(|error| {
+            crate::Error::Provider(format!("could not file the errand: {error}"))
+        })?;
 
         // The promise is now a record, and the record is signed.
         let log = apiary_core::log::EpisodicLog::open(&self.door.agent_dir);
@@ -373,15 +374,14 @@ impl crate::connector::Connector for AskRequester {
     fn def(&self) -> crate::connector::ToolDef {
         crate::connector::ToolDef {
             name: "ask_requester".into(),
-            description:
-                "Ask the person who requested this work one focused question, when \
+            description: "Ask the person who requested this work one focused question, when \
                  something genuinely blocks you and one line from them would unblock it. \
                  The question is posted back to them and the work is parked until they \
                  answer, then resumes carrying their answer. Ask about the WORK — which \
                  product line, which of two readings they meant. Never ask for permission \
                  to continue: they already asked you for this. One question at a time, \
                  and only when guessing would waste more than asking."
-                    .into(),
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -416,7 +416,9 @@ impl crate::connector::Connector for AskRequester {
         let mut state = file.load();
         let now = Utc::now();
         let Some(errand) = state.errands.iter_mut().find(|errand| errand.id == id) else {
-            return Err(crate::Error::Provider("that work is no longer on file".into()));
+            return Err(crate::Error::Provider(
+                "that work is no longer on file".into(),
+            ));
         };
         errand.ask(question.clone(), now);
         let asked = errand.questions_asked;
@@ -441,9 +443,11 @@ impl crate::connector::Connector for AskRequester {
                 })),
             },
         )?;
-        Ok("Your question will be posted to them and this work is parked until they \
+        Ok(
+            "Your question will be posted to them and this work is parked until they \
             answer. Stop now — do not also guess an answer and carry on."
-            .into())
+                .into(),
+        )
     }
 }
 
@@ -469,7 +473,8 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("apiary-errands-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("apiary-errands-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -517,10 +522,7 @@ mod tests {
         let (working, _, _) = door_for(&dir, Some("e1"));
         assert!(filing.errand_id.is_none());
         assert_eq!(FollowUp { door: filing }.def().name, "follow_up");
-        assert_eq!(
-            AskRequester { door: working }.def().name,
-            "ask_requester"
-        );
+        assert_eq!(AskRequester { door: working }.def().name, "ask_requester");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -629,7 +631,10 @@ mod tests {
         e.ask("Which product line?".into(), now + Duration::minutes(30));
         assert_eq!(e.state, State::Asked);
         assert!(e.expires_at > now + Duration::minutes(DEFAULT_EXPIRY_MINS));
-        assert_eq!(e.tokens, original_ceiling, "asking is not a budget increase");
+        assert_eq!(
+            e.tokens, original_ceiling,
+            "asking is not a budget increase"
+        );
         assert_eq!(e.questions_asked, 1);
         // An open question is still owed to somebody.
         assert!(e.state.is_outstanding());

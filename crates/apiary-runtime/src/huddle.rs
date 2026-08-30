@@ -48,7 +48,10 @@ impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FrameError::TooShort(n) => {
-                write!(f, "huddle frame is {n} bytes; the header alone needs {HEADER_LEN}")
+                write!(
+                    f,
+                    "huddle frame is {n} bytes; the header alone needs {HEADER_LEN}"
+                )
             }
         }
     }

@@ -100,7 +100,9 @@ fn new_connection(uri: &str) -> Result<RemoteSigner, String> {
         secret.unwrap_or_default(),
     ];
     params.push("sign_event:4600".into());
-    params.push(json!({"name": "Apiary", "url": "https://github.com/farspeak-labs/apiary"}).to_string());
+    params.push(
+        json!({"name": "Apiary", "url": "https://github.com/farspeak-labs/apiary"}).to_string(),
+    );
     let message = nip46::NostrConnectMessage::Request {
         id: random_token(),
         method: nip46::NostrConnectMethod::Connect,

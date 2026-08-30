@@ -1051,11 +1051,7 @@ fn discover_acp_harnesses_from(
                 // The adapter that speaks ACP on Claude Code's behalf.
                 // Claude Code itself is an inference provider here and is
                 // deliberately tool-less, so the adapter is the harness.
-                (
-                    "claude-code-acp",
-                    "claude-code-acp",
-                    "Claude Code harness",
-                ),
+                ("claude-code-acp", "claude-code-acp", "Claude Code harness"),
             ] {
                 let candidate = directory.join(binary);
                 if executable(&candidate) && seen.insert(candidate.clone()) {
@@ -1586,6 +1582,7 @@ fn valid_inference_provider(role: &str, provider: &str) -> bool {
             provider,
             "claude-code"
                 | "codex"
+                | "grok-code"
                 | "anthropic"
                 | "openai"
                 | "xai"
@@ -1614,6 +1611,9 @@ fn credential_source(slot: &apiary_core::manifest::InferenceSlot) -> String {
     }
     if slot.provider == "codex" {
         return "local ChatGPT sign-in".into();
+    }
+    if slot.provider == "grok-code" {
+        return "local Grok sign-in".into();
     }
     if slot.credential.is_some() {
         return "sealed API key".into();
@@ -1751,6 +1751,22 @@ fn probe_inference_slot(slot: &apiary_core::manifest::InferenceSlot) -> serde_js
                 }
             }
         }
+        "grok-code" => {
+            if !apiary_runtime::inference::grok_code_is_installed() {
+                result("unavailable", "Grok Build (the grok CLI) is not installed".into())
+            } else {
+                match apiary_runtime::inference::grok_code_auth_status() {
+                    Ok(account) => result(
+                        "ready",
+                        format!("Grok Build is signed in on this Mac ({account})"),
+                    ),
+                    Err(apiary_runtime::Error::Provider(detail)) => {
+                        result("unavailable", detail)
+                    }
+                    Err(error) => result("unavailable", error.to_string()),
+                }
+            }
+        }
         "anthropic"
             if slot.requires.get("auth").and_then(|value| value.as_str()) == Some("oauth") =>
         {
@@ -1822,6 +1838,10 @@ fn inference_probe_key(slot: &apiary_core::manifest::InferenceSlot) -> String {
     if slot.provider == "codex" {
         // All Codex routes share one local ChatGPT account and executable.
         return "codex-chatgpt-account".into();
+    }
+    if slot.provider == "grok-code" {
+        // All Grok routes share one local SuperGrok account and executable.
+        return "grok-code-account".into();
     }
     serde_json::to_string(&json!({
         "provider": slot.provider,
@@ -2138,7 +2158,7 @@ pub async fn inference_upsert(
         )
         .into_response();
     }
-    if matches!(provider.as_str(), "claude-code" | "codex")
+    if matches!(provider.as_str(), "claude-code" | "codex" | "grok-code")
         && body
             .credential
             .as_deref()
@@ -2148,7 +2168,11 @@ pub async fn inference_upsert(
             StatusCode::BAD_REQUEST,
             format!(
                 "{} uses the account signed in on this Mac; it does not accept a per-route credential",
-                if provider == "codex" { "Codex" } else { "Claude Code" }
+                match provider.as_str() {
+                    "codex" => "Codex",
+                    "grok-code" => "Grok Build",
+                    _ => "Claude Code",
+                }
             ),
         )
         .into_response();
@@ -2177,36 +2201,37 @@ pub async fn inference_upsert(
         .credential
         .filter(|secret| !secret.trim().is_empty())
         .map(|secret| Zeroizing::new(secret.trim().to_string()));
-    let credential =
-        if matches!(provider.as_str(), "claude-code" | "codex") || body.clear_credential {
-            None
-        } else if let Some(secret) = supplied_secret {
-            let pass = match require_pass(&state) {
-                Ok(p) => p,
-                Err(e) => return e.into_response(),
-            };
-            let npub2 = npub.clone();
-            match tokio::task::spawn_blocking(move || {
-                let (custody, handle) = admit(&ks, &npub2, &pass)?;
-                custody
-                    .seal(&handle, secret.as_str())
-                    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
-            })
-            .await
-            .unwrap_or_else(|e| Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)))
-            {
-                Ok(blob) => Some(blob),
-                Err(e) => return e.into_response(),
-            }
-        } else {
-            let auth_unchanged = existing.as_ref().is_none_or(|slot| {
-                slot.requires.get("auth").and_then(|value| value.as_str()) == auth
-            });
-            existing
-                .as_ref()
-                .filter(|slot| slot.provider == provider && auth_unchanged)
-                .and_then(|s| s.credential.clone())
+    let credential = if matches!(provider.as_str(), "claude-code" | "codex" | "grok-code")
+        || body.clear_credential
+    {
+        None
+    } else if let Some(secret) = supplied_secret {
+        let pass = match require_pass(&state) {
+            Ok(p) => p,
+            Err(e) => return e.into_response(),
         };
+        let npub2 = npub.clone();
+        match tokio::task::spawn_blocking(move || {
+            let (custody, handle) = admit(&ks, &npub2, &pass)?;
+            custody
+                .seal(&handle, secret.as_str())
+                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+        })
+        .await
+        .unwrap_or_else(|e| Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)))
+        {
+            Ok(blob) => Some(blob),
+            Err(e) => return e.into_response(),
+        }
+    } else {
+        let auth_unchanged = existing
+            .as_ref()
+            .is_none_or(|slot| slot.requires.get("auth").and_then(|value| value.as_str()) == auth);
+        existing
+            .as_ref()
+            .filter(|slot| slot.provider == provider && auth_unchanged)
+            .and_then(|s| s.credential.clone())
+    };
     let slot = apiary_core::manifest::InferenceSlot {
         name: name.clone(),
         provider,
@@ -2366,6 +2391,7 @@ mod inference_setup_tests {
     fn provider_matrix_rejects_cross_role_bindings() {
         assert!(valid_inference_provider("language", "claude-code"));
         assert!(valid_inference_provider("language", "codex"));
+        assert!(valid_inference_provider("language", "grok-code"));
         assert!(valid_inference_provider("language", "anthropic"));
         assert!(valid_inference_provider("embedding", "ollama"));
         assert!(valid_inference_provider("transcription", "apple-speech"));
@@ -5496,8 +5522,9 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
                     );
                 // Once per manifest revision, not once per 10s tick — the
                 // note map above keeps it visible in the UI the whole time.
-                static NOTED: std::sync::OnceLock<Mutex<std::collections::HashMap<String, String>>> =
-                    std::sync::OnceLock::new();
+                static NOTED: std::sync::OnceLock<
+                    Mutex<std::collections::HashMap<String, String>>,
+                > = std::sync::OnceLock::new();
                 let mut noted = NOTED
                     .get_or_init(Default::default)
                     .lock()

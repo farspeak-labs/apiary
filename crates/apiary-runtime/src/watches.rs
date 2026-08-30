@@ -124,7 +124,10 @@ pub fn scan_vault(root: &Path, since: Option<DateTime<Utc>>, filter: Option<&str
             if since.is_some_and(|s| modified <= s) {
                 continue;
             }
-            out.newest = Some(out.newest.map_or(modified, |n: DateTime<Utc>| n.max(modified)));
+            out.newest = Some(
+                out.newest
+                    .map_or(modified, |n: DateTime<Utc>| n.max(modified)),
+            );
             out.paths.push(display);
         }
     }
@@ -145,12 +148,7 @@ pub enum Step {
 
 /// Decide (and record) what happens to one watch, given what a scan found.
 /// Pure except for mutating the record — the caller persists and fires.
-pub fn step(
-    watch: &Watch,
-    record: &mut WatchRecord,
-    changes: Changes,
-    now: DateTime<Utc>,
-) -> Step {
+pub fn step(watch: &Watch, record: &mut WatchRecord, changes: Changes, now: DateTime<Utc>) -> Step {
     let today = now.format("%Y-%m-%d").to_string();
     if record.day != today {
         record.day = today;
@@ -265,7 +263,10 @@ mod tests {
         let mut rec = WatchRecord::default();
         let now = Utc::now();
         // A folder full of old files must not fire anything.
-        assert_eq!(step(&w, &mut rec, changes(&["old.md"], now), now), Step::Wait);
+        assert_eq!(
+            step(&w, &mut rec, changes(&["old.md"], now), now),
+            Step::Wait
+        );
         assert!(rec.seen_through.is_some());
         assert!(rec.pending_paths.is_empty());
     }
@@ -354,9 +355,15 @@ mod tests {
             ..Default::default()
         };
         let t0 = Utc::now();
-        assert_eq!(step(&w, &mut rec, changes(&["BRIEF.md"], t0), t0), Step::Wait);
+        assert_eq!(
+            step(&w, &mut rec, changes(&["BRIEF.md"], t0), t0),
+            Step::Wait
+        );
         let t1 = t0 + chrono::Duration::seconds(2);
-        assert!(matches!(step(&w, &mut rec, Changes::default(), t1), Step::Fire { .. }));
+        assert!(matches!(
+            step(&w, &mut rec, Changes::default(), t1),
+            Step::Fire { .. }
+        ));
         // The run drafts into the same folder and finishes.
         let wrote_at = t1 + chrono::Duration::seconds(5);
         let finished = wrote_at + chrono::Duration::seconds(1);
@@ -373,7 +380,10 @@ mod tests {
             step(&w, &mut rec, changes(&["BRIEF.md"], human_edit), human_edit),
             Step::Wait
         );
-        assert!(rec.pending_since.is_some(), "a genuine later change still queues");
+        assert!(
+            rec.pending_since.is_some(),
+            "a genuine later change still queues"
+        );
     }
 
     #[test]
@@ -386,7 +396,12 @@ mod tests {
         std::fs::write(root.join("notes.txt"), "x").unwrap();
         let long_ago = Utc::now() - chrono::Duration::days(1);
         let all = scan_vault(&root, Some(long_ago), None);
-        assert_eq!(all.paths.len(), 2, "hidden files are not news: {:?}", all.paths);
+        assert_eq!(
+            all.paths.len(),
+            2,
+            "hidden files are not news: {:?}",
+            all.paths
+        );
         let filtered = scan_vault(&root, Some(long_ago), Some("PROJECT.md"));
         assert_eq!(filtered.paths, vec!["sub/PROJECT.md".to_string()]);
         // Nothing is newer than the future.

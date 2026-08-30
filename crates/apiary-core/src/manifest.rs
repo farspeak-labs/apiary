@@ -467,7 +467,7 @@ impl Skill {
 pub struct InferenceSlot {
     /// Pool-local name routing rules refer to: "workhorse", "fast", "local", "embed".
     pub name: String,
-    /// "claude-code" | "codex" | "anthropic" | "openai" | "xai" | "ollama" | "mock".
+    /// "claude-code" | "codex" | "grok-code" | "anthropic" | "openai" | "xai" | "ollama" | "mock".
     /// Claude Code and Codex use subscription auth through guarded local CLIs.
     /// The openai and xai providers speak the OpenAI-compatible dialect; `requires.
     /// base_url` points either at any compatible endpoint (Groq, Together,
@@ -693,7 +693,12 @@ impl KnowledgeHome {
         } else {
             slug.chars().take(80).collect()
         };
-        match self.folder.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+        match self
+            .folder
+            .as_deref()
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+        {
             Some(folder) => format!("{}/{slug}.md", folder.trim_matches('/')),
             None => format!("{slug}.md"),
         }
@@ -1372,7 +1377,8 @@ impl Manifest {
                 )));
             }
             if w.on == "vault" {
-                let Some(vault) = w.vault.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+                let Some(vault) = w.vault.as_deref().map(str::trim).filter(|v| !v.is_empty())
+                else {
                     return Err(crate::Error::Manifest(format!(
                         "watch '{}' watches a vault but names none",
                         w.name

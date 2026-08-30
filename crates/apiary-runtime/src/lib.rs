@@ -27,8 +27,8 @@ pub mod speak;
 pub mod spend;
 pub mod telegram;
 pub mod transcribe;
-pub mod watches;
 pub mod vault;
+pub mod watches;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

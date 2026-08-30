@@ -255,8 +255,8 @@ pub async fn list_watches(
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     let running_now = running().lock().unwrap().clone();
-    let allowance =
-        apiary_runtime::spend::proactive_tokens_per_day(&manifest.governance.budgets).unwrap_or(None);
+    let allowance = apiary_runtime::spend::proactive_tokens_per_day(&manifest.governance.budgets)
+        .unwrap_or(None);
     let items: Vec<serde_json::Value> = manifest
         .watches
         .iter()

@@ -1749,13 +1749,33 @@ function readinessChecklist(c, m, roster, listener, spend) {
 async function relayReachability(c) {
   const m = await j(api('/buzz/membership'));
   if (!m.ok || !m.configured) return;
+  // Two questions, not one. Membership is permission; a published profile
+  // is identity. A member with no profile is reachable and invisible —
+  // it answers a DM and cannot be found in any picker.
+  const findable = m.member && m.announced;
   const box = el('div', 'ev');
-  const known = m.member;
-  box.style.borderColor = known ? 'var(--line)' : 'var(--amber)';
-  box.append(el('b', null, known ? 'Reachable on its relay' : 'Not reachable on its relay'));
+  box.style.borderColor = findable ? 'var(--line)' : 'var(--amber)';
+  box.append(el('b', null, !m.member
+    ? 'Not reachable on its relay'
+    : m.announced ? 'Reachable and findable' : 'Reachable, but nobody can find it'));
   const row = el('div', 'kv');
   row.append(el('span', 'k', m.relay || 'relay'), el('span', 'v', m.detail || ''));
   box.append(row);
+  if (m.member && !m.announced) {
+    box.append(help('It is a member of this relay but has never published a profile there, so it will not appear when you search for it in a channel member list. Publishing says who it is; it changes no permission.'));
+    const pub = el('button', 'btn solid', 'Publish its profile');
+    const pubSt = el('span', 'meta', '');
+    const pubRow = el('div', 'row'); pubRow.append(pub, pubSt);
+    box.append(pubRow);
+    pub.onclick = async () => {
+      pub.disabled = true; pubSt.textContent = 'Publishing…';
+      const r = await j(api('/buzz/announce'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+      pub.disabled = false;
+      if (!r.ok) { pubSt.textContent = r.error || 'Could not publish.'; return; }
+      pubSt.textContent = 'Published. Re-checking…';
+      render();
+    };
+  }
   if (!known) {
     box.append(help('An agent must be a relay member before anyone can reach it. Paste an invite from the relay and it will join using its own key — nothing about your identity is used, and this host stores no relay admin credential.'));
     const code = el('input');
@@ -2349,7 +2369,7 @@ function inferenceForm(slot, afterSave) {
   const refreshAuth = () => {
     const anthropic = role.value === 'language' && provider.value === 'anthropic';
     auth.closest('.field').style.display = anthropic ? '' : 'none';
-    const subscription = role.value === 'language' && ['claude-code', 'codex'].includes(provider.value);
+    const subscription = role.value === 'language' && ['claude-code', 'codex', 'grok-code'].includes(provider.value);
     credential.closest('.field').style.display = subscription ? 'none' : '';
     credential.placeholder = slot && slot.credential_source === 'sealed API key'
       ? 'Leave blank to keep current API key'
@@ -2419,7 +2439,7 @@ function inferenceForm(slot, afterSave) {
       requires.auth = 'api-key';
       delete requires.oauth_profile;
     } else { delete requires.auth; delete requires.oauth_profile; }
-    if (['claude-code', 'codex'].includes(provider.value)) delete requires.base_url;
+    if (['claude-code', 'codex', 'grok-code'].includes(provider.value)) delete requires.base_url;
     if (voice.value.trim()) requires.voice = voice.value.trim(); else delete requires.voice;
     if (locale.value.trim()) requires.locale = locale.value.trim(); else delete requires.locale;
     save.disabled = true;

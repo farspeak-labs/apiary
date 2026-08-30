@@ -140,10 +140,18 @@ governance:
     assert_eq!(home.vault.as_deref(), Some("TeamKB"));
 
     // Points at a vault it was never given: refused, and says why.
-    let error = manifest(&format!("{granted}  knowledge_home:\n    vault: SomeoneElsesKB\n"))
-        .expect_err("cannot write knowledge into a vault it has no access to");
-    assert!(error.to_string().contains("has not been granted"), "{error}");
-    assert!(error.to_string().contains("destination, not a grant"), "{error}");
+    let error = manifest(&format!(
+        "{granted}  knowledge_home:\n    vault: SomeoneElsesKB\n"
+    ))
+    .expect_err("cannot write knowledge into a vault it has no access to");
+    assert!(
+        error.to_string().contains("has not been granted"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("destination, not a grant"),
+        "{error}"
+    );
 
     // Cannot escape the vault it was pointed at.
     for bad in ["../elsewhere", "/etc", "notes/../../escape"] {
@@ -247,9 +255,12 @@ governance:
     assert!(error.to_string().contains("pick one place"), "{error}");
 
     // Neither is refused too.
-    let error = manifest("  knowledge_home:\n    folder: notes\n")
-        .expect_err("a home must name somewhere");
-    assert!(error.to_string().contains("needs a vault or a connector"), "{error}");
+    let error =
+        manifest("  knowledge_home:\n    folder: notes\n").expect_err("a home must name somewhere");
+    assert!(
+        error.to_string().contains("needs a vault or a connector"),
+        "{error}"
+    );
 }
 
 /// A harness is a capability. Routing can point work at one, but pointing
@@ -286,7 +297,10 @@ governance:
 
     // Pointed at without the grant: refused, and it says why.
     let error = manifest("  harness: coder\n").expect_err("routing cannot invent a capability");
-    assert!(error.to_string().contains("not a granted harness"), "{error}");
+    assert!(
+        error.to_string().contains("not a granted harness"),
+        "{error}"
+    );
 
     // Absent is the normal case — most agents have no harness at all, and
     // their work runs on the native loop.

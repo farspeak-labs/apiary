@@ -13,12 +13,12 @@ pub mod agent_store;
 pub mod agui;
 pub mod control_mcp;
 pub mod decision_gate;
+pub mod errands;
 pub mod events;
 pub mod nip46;
 pub mod nip98;
 pub mod ops;
 pub mod routines;
-pub mod errands;
 pub mod watches;
 
 use apiary_core::{
@@ -346,6 +346,10 @@ pub fn build_router(state: App) -> Router {
         .route(
             "/api/agents/{npub}/buzz/membership",
             get(errands::buzz_membership),
+        )
+        .route(
+            "/api/agents/{npub}/buzz/announce",
+            post(errands::announce_profile),
         )
         .route(
             "/api/agents/{npub}/routines/{name}/run",
@@ -1259,25 +1263,27 @@ impl Preset {
                 harness_args,
                 workdir,
             } => {
-                manifest.harnesses.push(apiary_core::manifest::HarnessGrant {
-                    name: "coder".into(),
-                    kind: "acp".into(),
-                    command: harness_command.clone(),
-                    args: harness_args.clone(),
-                    access: apiary_core::manifest::HarnessAccess::Full,
-                    // Its own HOME, so the host user's credentials are not
-                    // in scope. It needs its own login — the readiness panel
-                    // says so, because nothing else would.
-                    profile: apiary_core::manifest::HarnessProfile::Isolated,
-                    // NOT no-network: that profile denies the whole process,
-                    // and a loop that cannot reach a model cannot run.
-                    sandbox: apiary_core::manifest::HarnessSandbox::None,
-                    allowed_tools: Vec::new(),
-                    inherit_env: Vec::new(),
-                    metering: apiary_core::manifest::HarnessMetering::Estimated,
-                    estimated_tokens_per_run: Some(60_000),
-                    workdir: Some(workdir.clone()),
-                });
+                manifest
+                    .harnesses
+                    .push(apiary_core::manifest::HarnessGrant {
+                        name: "coder".into(),
+                        kind: "acp".into(),
+                        command: harness_command.clone(),
+                        args: harness_args.clone(),
+                        access: apiary_core::manifest::HarnessAccess::Full,
+                        // Its own HOME, so the host user's credentials are not
+                        // in scope. It needs its own login — the readiness panel
+                        // says so, because nothing else would.
+                        profile: apiary_core::manifest::HarnessProfile::Isolated,
+                        // NOT no-network: that profile denies the whole process,
+                        // and a loop that cannot reach a model cannot run.
+                        sandbox: apiary_core::manifest::HarnessSandbox::None,
+                        allowed_tools: Vec::new(),
+                        inherit_env: Vec::new(),
+                        metering: apiary_core::manifest::HarnessMetering::Estimated,
+                        estimated_tokens_per_run: Some(60_000),
+                        workdir: Some(workdir.clone()),
+                    });
                 // Pointing work at it is a separate line, and without it the
                 // grant sits unused — the exact gap that made the first
                 // builder agent unreachable by conversation.
@@ -1293,11 +1299,14 @@ impl Preset {
                     .insert("proactive_tokens_per_day".into(), json!(200_000));
             }
             Preset::Watcher { vault, path } => {
-                manifest.memory.vaults.push(apiary_core::manifest::VaultRef {
-                    name: vault.clone(),
-                    path: path.clone(),
-                    kind: None,
-                });
+                manifest
+                    .memory
+                    .vaults
+                    .push(apiary_core::manifest::VaultRef {
+                        name: vault.clone(),
+                        path: path.clone(),
+                        kind: None,
+                    });
                 // A watch with no proactive allowance is inert, and says so
                 // only on an endpoint nobody visits.
                 manifest
@@ -1519,7 +1528,8 @@ mod tests {
             .unwrap()
         };
         let plain = with_autonomy("");
-        let autonomous = with_autonomy("  autonomy:\n    ratify: true\n    open_credentials: true\n");
+        let autonomous =
+            with_autonomy("  autonomy:\n    ratify: true\n    open_credentials: true\n");
 
         // Nothing granted: either signer may ratify.
         assert!(check_autonomy_grant(&ks, &dir, &plain, &lead.public_key()).is_ok());
@@ -1528,8 +1538,14 @@ mod tests {
         assert!(check_autonomy_grant(&ks, &dir, &autonomous, &person).is_ok());
         let refused = check_autonomy_grant(&ks, &dir, &autonomous, &lead.public_key())
             .expect_err("an agent must not be able to grant autonomy");
-        assert!(refused.contains("Autonomy can never grant autonomy"), "{refused}");
-        assert!(refused.contains("open credentials"), "names what it would grant: {refused}");
+        assert!(
+            refused.contains("Autonomy can never grant autonomy"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("open credentials"),
+            "names what it would grant: {refused}"
+        );
 
         // Once a person HAS granted it, the agent may ratify manifests that
         // do not widen it further — autonomy is usable, just not self-issued.

@@ -147,10 +147,24 @@ pub fn reconcile_errands(state: &App) {
 
 /// Run one errand and settle it. Every exit from here either delivers
 /// something or says why it could not — there is no silent path out.
-fn run_errand(state: &App, npub: &str, manifest: &Manifest, dir: &std::path::Path, errand: &Errand) {
+fn run_errand(
+    state: &App,
+    npub: &str,
+    manifest: &Manifest,
+    dir: &std::path::Path,
+    errand: &Errand,
+) {
     let started = Utc::now();
     let Ok(ks) = Keystore::open(&state.home) else {
-        return settle(state, npub, manifest, dir, errand, State::Failed, "keystore");
+        return settle(
+            state,
+            npub,
+            manifest,
+            dir,
+            errand,
+            State::Failed,
+            "keystore",
+        );
     };
     let (custody, handle) = match admit_agent(state, &ks, npub) {
         Ok(pair) => pair,
@@ -188,8 +202,7 @@ fn run_errand(state: &App, npub: &str, manifest: &Manifest, dir: &std::path::Pat
         ..Default::default()
     };
     let task = apiary_runtime::errands::task_text(errand);
-    let result =
-        apiary_runtime::runner::run_task(manifest, dir, &custody, &handle, &task, &ctx);
+    let result = apiary_runtime::runner::run_task(manifest, dir, &custody, &handle, &task, &ctx);
     if result.is_ok() {
         apiary_runtime::index::schedule_refresh(manifest.clone(), dir.to_path_buf());
     }
@@ -230,7 +243,12 @@ fn run_errand(state: &App, npub: &str, manifest: &Manifest, dir: &std::path::Pat
         Ok(out) if !out.completion.text.trim().is_empty() => {
             let text: String = out.completion.text.trim().chars().take(8000).collect();
             speak(state, npub, manifest, dir, errand, &text, "errand.run");
-            mark(dir, &errand.id, State::Delivered, Some(out.completion.outcome));
+            mark(
+                dir,
+                &errand.id,
+                State::Delivered,
+                Some(out.completion.outcome),
+            );
             note(
                 state,
                 npub,
@@ -445,17 +463,11 @@ pub async fn cancel_errand(
     Json(body): Json<CancelBody>,
 ) -> impl IntoResponse {
     let raw_body = serde_json::to_vec(&json!({ "id": body.id })).unwrap_or_default();
-    let (_ks, npub, dir, _raw, manifest) = match crate::ops::gate_pub(
-        &state,
-        &headers,
-        "POST",
-        &uri,
-        Some(&raw_body),
-        &npub,
-    ) {
-        Ok(value) => value,
-        Err(error) => return error.into_response(),
-    };
+    let (_ks, npub, dir, _raw, manifest) =
+        match crate::ops::gate_pub(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
     let file = ErrandsFile::open(&dir);
     let mut errands = file.load();
     let Some(errand) = errands
@@ -494,7 +506,6 @@ pub async fn cancel_errand(
     Json(json!({ "ok": true, "id": cancelled.id })).into_response()
 }
 
-
 // ------------------------------------------------- relay membership
 
 #[derive(serde::Deserialize)]
@@ -521,17 +532,11 @@ pub async fn join_relay(
     Json(body): Json<JoinRelayBody>,
 ) -> impl IntoResponse {
     let raw_body = serde_json::to_vec(&json!({ "code": body.code })).unwrap_or_default();
-    let (ks, npub, dir, _raw, manifest) = match crate::ops::gate_pub(
-        &state,
-        &headers,
-        "POST",
-        &uri,
-        Some(&raw_body),
-        &npub,
-    ) {
-        Ok(value) => value,
-        Err(error) => return error.into_response(),
-    };
+    let (ks, npub, dir, _raw, manifest) =
+        match crate::ops::gate_pub(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
     let Some(relay) = manifest
         .presence
         .channel("buzz")
@@ -551,12 +556,21 @@ pub async fn join_relay(
                 .into_response()
         }
     };
+    let name = std::fs::read_to_string(dir.join("name"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let name = if name.is_empty() {
+        npub.chars().take(12).collect::<String>()
+    } else {
+        name
+    };
     let outcome = tokio::task::spawn_blocking(move || {
-        apiary_runtime::buzz::join_relay(&relay, &body.code, &custody, &handle)
+        apiary_runtime::buzz::join_relay_as(&relay, &body.code, &name, &custody, &handle)
             .map(|response| (relay, response, custody, handle))
     })
     .await;
-    let (relay, response, custody, handle) = match outcome {
+    let (relay, (response, announce_error), custody, handle) = match outcome {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => {
             return crate::err(axum::http::StatusCode::BAD_GATEWAY, error.to_string())
@@ -585,7 +599,84 @@ pub async fn join_relay(
             detail: Some(json!({ "relay": relay })),
         },
     );
-    Json(json!({ "ok": true, "relay": relay, "response": response })).into_response()
+    Json(json!({
+        "ok": true,
+        "relay": relay,
+        "response": response,
+        // Joined but not announced is a real state and the caller has to
+        // know: the agent can be reached and cannot be found.
+        "announced": announce_error.is_none(),
+        "announce_error": announce_error,
+    }))
+    .into_response()
+}
+
+/// POST /api/agents/{npub}/buzz/announce — publish the agent's profile to
+/// its relay, so people can find it.
+///
+/// The listener does this when it starts, which covers the relay the
+/// ratified manifest names and nothing else. An agent an operator added to
+/// a second relay is a member there with no identity — reachable, and
+/// invisible to every picker and autocomplete.
+pub async fn announce_profile(
+    AxState(state): AxState<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (ks, npub, dir, _raw, manifest) =
+        match crate::ops::gate_pub(&state, &headers, "POST", &uri, Some(b""), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let Some(relay) = manifest
+        .presence
+        .channel("buzz")
+        .and_then(|channel| channel.str_config("relay"))
+        .map(str::to_string)
+    else {
+        return crate::err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "this agent has no buzz presence, so there is no relay to announce on",
+        )
+        .into_response();
+    };
+    let name = std::fs::read_to_string(dir.join("name"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return crate::err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "this agent has no name to publish",
+        )
+        .into_response();
+    }
+    let (custody, handle) = match crate::admit_agent(&state, &ks, &npub) {
+        Ok(pair) => pair,
+        Err(error) => {
+            return crate::err(axum::http::StatusCode::BAD_REQUEST, error.to_string())
+                .into_response()
+        }
+    };
+    let relay2 = relay.clone();
+    let published = tokio::task::spawn_blocking(move || {
+        apiary_runtime::buzz::announce(&relay2, &name, &custody, &handle)
+    })
+    .await;
+    match published {
+        Ok(Ok(event)) => {
+            Json(json!({ "ok": true, "relay": relay, "event": event })).into_response()
+        }
+        Ok(Err(error)) => {
+            crate::err(axum::http::StatusCode::BAD_GATEWAY, error.to_string()).into_response()
+        }
+        Err(error) => crate::err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            error.to_string(),
+        )
+        .into_response(),
+    }
 }
 
 /// GET /api/agents/{npub}/buzz/membership — verify reachability rather
@@ -625,13 +716,18 @@ pub async fn buzz_membership(
         apiary_runtime::buzz::check_membership(&relay2, &custody, &handle)
     })
     .await;
-    let (member, detail) = checked.unwrap_or_else(|e| (false, e.to_string()));
+    let reach = checked.unwrap_or_else(|e| apiary_runtime::buzz::Reachability {
+        member: false,
+        announced: false,
+        detail: e.to_string(),
+    });
     Json(json!({
         "ok": true,
         "configured": true,
         "relay": relay,
-        "member": member,
-        "detail": detail,
+        "member": reach.member,
+        "announced": reach.announced,
+        "detail": reach.detail,
     }))
     .into_response()
 }

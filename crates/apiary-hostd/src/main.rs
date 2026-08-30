@@ -59,7 +59,8 @@ fn write_headless_unlock(path: &std::path::Path, passphrase: &str) -> Result<(),
         opts.mode(0o600);
     }
     let mut f = opts.open(path).map_err(|e| e.to_string())?;
-    f.write_all(passphrase.as_bytes()).map_err(|e| e.to_string())
+    f.write_all(passphrase.as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 /// Read + verify the stored passphrase; None (with a loud note) if the
@@ -81,7 +82,10 @@ fn read_headless_unlock(home: &std::path::Path) -> Option<String> {
         });
     match verified {
         Ok(_) => {
-            eprintln!("headless unlock: workspace unlocked from {}", path.display());
+            eprintln!(
+                "headless unlock: workspace unlocked from {}",
+                path.display()
+            );
             Some(pass)
         }
         Err(e) => {

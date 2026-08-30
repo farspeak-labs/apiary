@@ -95,8 +95,16 @@ pub fn bind_connectors_in(
     for entry in &manifest.connectors {
         match entry.kind.as_str() {
             "mcp" => out.extend(bind_mcp(entry, custody, agent, agent_dir)?),
-            "obsidian" => out.extend(bind_vault(entry, true, manifest.memory.knowledge_home.as_ref())?),
-            "markdown-vault" => out.extend(bind_vault(entry, false, manifest.memory.knowledge_home.as_ref())?),
+            "obsidian" => out.extend(bind_vault(
+                entry,
+                true,
+                manifest.memory.knowledge_home.as_ref(),
+            )?),
+            "markdown-vault" => out.extend(bind_vault(
+                entry,
+                false,
+                manifest.memory.knowledge_home.as_ref(),
+            )?),
             "web-search" => {
                 out.push(Box::new(bind_web_search(entry)?));
                 // A full-research grant can deliberately include the public page
@@ -183,7 +191,12 @@ pub fn bind_connectors_in(
         .as_ref()
         .filter(|h| h.connector.is_some())
     {
-        if let Some(wanted) = home.tool.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        if let Some(wanted) = home
+            .tool
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
             let sanitized = crate::mcp::model_tool_name(wanted);
             if let Some(pos) = out
                 .iter()
@@ -432,9 +445,7 @@ fn bind_mcp(
     // routinely expires between runs — the refresh token is the durable
     // grant. Without this every bind (so every mention) dies on a token
     // that the tool-call path would have refreshed anyway.
-    let auth_required = |e: &crate::Error| {
-        matches!(e, crate::Error::Provider(m) if m.starts_with("mcp-auth-required"))
-    };
+    let auth_required = |e: &crate::Error| matches!(e, crate::Error::Provider(m) if m.starts_with("mcp-auth-required"));
     let refresh_or = |e: crate::Error| match &refresh {
         Some(r) => refresh_access_token(r).map_err(|re| {
             crate::Error::Provider(format!(
@@ -1999,9 +2010,11 @@ fn bind_vault(
         // AND that destination is one of the vaults this connector can
         // write. No declaration, no durable memory — the agent is not left
         // guessing where its knowledge should go.
-        if let Some(home) =
-            home.filter(|h| h.vault.as_deref().is_some_and(|v| vault_names.iter().any(|n| n == v)))
-        {
+        if let Some(home) = home.filter(|h| {
+            h.vault
+                .as_deref()
+                .is_some_and(|v| vault_names.iter().any(|n| n == v))
+        }) {
             out.push(Box::new(RememberNote {
                 home: home.clone(),
                 to: Destination::Vault {
@@ -2483,8 +2496,7 @@ fn write_into_vault(
             .any(|c| !matches!(c, std::path::Component::Normal(_)))
     {
         return Err(crate::Error::Provider(
-            "path must be a plain vault-relative .md file (no traversal, no absolute paths)"
-                .into(),
+            "path must be a plain vault-relative .md file (no traversal, no absolute paths)".into(),
         ));
     }
     let target = root.join(rel_path);
@@ -2582,7 +2594,7 @@ impl Connector for VaultWrite {
             .ok_or_else(|| crate::Error::Provider("content is required".into()))?;
         let append = args.get("append").and_then(|v| v.as_bool()).unwrap_or(true);
         let (name, root) = vault_root(&self.vaults, args.get("vault").and_then(|v| v.as_str()))?;
-        let appended = write_into_vault(&root, rel, content, append)?;
+        let appended = write_into_vault(root, rel, content, append)?;
         let _ = self.kind;
         Ok(json!({"vault": name, "path": rel, "written": true, "appended": appended}).to_string())
     }

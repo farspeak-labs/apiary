@@ -11,7 +11,7 @@ export function inferenceRoleForName(name) {
 }
 
 export const inferenceProviders = {
-  language: [['claude-code', 'Claude Code (subscription)'], ['codex', 'ChatGPT subscription (Codex)'], ['anthropic', 'Anthropic API'], ['openai', 'OpenAI compatible'], ['xai', 'xAI'], ['ollama', 'Ollama (local)']],
+  language: [['claude-code', 'Claude Code (subscription)'], ['codex', 'ChatGPT subscription (Codex)'], ['grok-code', 'Grok subscription (Grok Build)'], ['anthropic', 'Anthropic API'], ['openai', 'OpenAI compatible'], ['xai', 'xAI'], ['ollama', 'Ollama (local)']],
   embedding: [['ollama', 'Ollama (local)'], ['hash', 'Built-in lexical index']],
   transcription: [['apple-speech', 'Apple Speech (local)'], ['whisper-cpp', 'whisper.cpp (local)'], ['openai', 'OpenAI compatible']],
   speech: [['openai', 'OpenAI compatible / Kokoro'], ['apple-speech', 'Apple Speech (local)'], ['macos-say', 'macOS voices']],
@@ -27,6 +27,10 @@ export const inferenceModels = {
       ['claude-opus-5', 'Claude Opus 5 · complex work'],
       ['claude-haiku-4-5-20251001', 'Claude Haiku 4.5 · fastest'],
       ['claude-fable-5', 'Claude Fable 5 · highest capability'],
+    ],
+    'grok-code': [
+      ['grok-4.6', 'Grok 4.6 · latest (recommended)'],
+      ['grok-4.5', 'Grok 4.5'],
     ],
     codex: [
       ['gpt-5.6-terra', 'GPT-5.6 Terra · balanced (recommended)'],
@@ -74,6 +78,7 @@ export function inferenceEndpoint(slot) {
   if (configured) return configured;
   if (slot.provider === 'claude-code') return 'local Claude Code runtime';
   if (slot.provider === 'codex') return 'local Codex runtime';
+  if (slot.provider === 'grok-code') return 'local Grok Build runtime';
   if (slot.provider === 'anthropic') return 'api.anthropic.com';
   if (slot.provider === 'xai') return 'api.x.ai';
   if (slot.provider === 'openai') return 'api.openai.com';

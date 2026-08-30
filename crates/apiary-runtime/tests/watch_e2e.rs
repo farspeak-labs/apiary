@@ -17,7 +17,10 @@ fn a_real_file_change_becomes_a_fire() {
     );
     let m = Manifest::from_yaml(&yaml).expect("watch manifest validates");
     let w = &m.watches[0];
-    let mut rec = WatchRecord { seen_through: Some(chrono::Utc::now() - chrono::Duration::hours(1)), ..Default::default() };
+    let mut rec = WatchRecord {
+        seen_through: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        ..Default::default()
+    };
     // Nothing yet.
     let now = chrono::Utc::now();
     let c0 = scan_vault(&root, rec.seen_through, w.match_path.as_deref());
@@ -25,9 +28,17 @@ fn a_real_file_change_becomes_a_fire() {
     // A real file lands.
     std::fs::write(root.join("PROJECT.md"), "# Apiary voice\nstatus: active\n").unwrap();
     let changes = scan_vault(&root, rec.seen_through, w.match_path.as_deref());
-    assert_eq!(changes.paths, vec!["PROJECT.md".to_string()], "the scan sees the new file");
+    assert_eq!(
+        changes.paths,
+        vec!["PROJECT.md".to_string()],
+        "the scan sees the new file"
+    );
     let t = chrono::Utc::now();
-    assert_eq!(step(w, &mut rec, changes, t), Step::Wait, "debounce holds it");
+    assert_eq!(
+        step(w, &mut rec, changes, t),
+        Step::Wait,
+        "debounce holds it"
+    );
     let later = t + chrono::Duration::seconds(2);
     let c2 = scan_vault(&root, rec.seen_through, w.match_path.as_deref());
     match step(w, &mut rec, c2, later) {
@@ -37,7 +48,11 @@ fn a_real_file_change_becomes_a_fire() {
     // An unrelated file is ignored by the filter.
     std::fs::write(root.join("scratch.md"), "x").unwrap();
     let after = scan_vault(&root, rec.seen_through, w.match_path.as_deref());
-    assert!(after.is_empty(), "the match filter holds: {:?}", after.paths);
+    assert!(
+        after.is_empty(),
+        "the match filter holds: {:?}",
+        after.paths
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -48,5 +63,8 @@ fn a_watch_on_an_ungranted_vault_is_refused() {
         governance:\n  suspend_keys:\n    - npub1kpmddremcthyftcuua6hjkt9hekc729j78qkhfgfvv35efjz0mnsgddfeg\n\
         watches:\n  - name: w\n    on: vault\n    vault: NotGranted\n    task: look\n";
     let error = Manifest::from_yaml(yaml).expect_err("cannot watch what it was never given");
-    assert!(error.to_string().contains("has not been granted"), "{error}");
+    assert!(
+        error.to_string().contains("has not been granted"),
+        "{error}"
+    );
 }

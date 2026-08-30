@@ -447,7 +447,6 @@ impl<'a> BuzzSession<'a> {
         Ok(())
     }
 
-
     /// Read back the last `limit` messages in a channel, oldest first.
     ///
     /// A separate short-lived subscription on the same authenticated socket:
@@ -722,7 +721,6 @@ impl<'a> BuzzAdapter<'a> {
     }
 }
 
-
 impl BuzzAdapter<'_> {
     /// Pick up channels created since the listener started.
     ///
@@ -812,25 +810,92 @@ pub fn join_relay(
     Ok(text)
 }
 
-/// Ask the relay whether this agent can actually reach it.
+/// Claim an invite AND say who you are.
 ///
-/// The cockpit used to *explain* that relay membership is separate and
-/// leave you to go and check. This checks: connect, authenticate, and try
-/// the cheapest read there is. Confirmed reachable or a reason, never a
-/// guess — a network failure is reported as a network failure rather than
-/// quietly rendered as "not a member".
-pub fn check_membership(relay: &str, custody: &Custody, agent: &AgentHandle) -> (bool, String) {
+/// Membership and identity are separate on a relay, and a join that stops
+/// at membership leaves an agent that is reachable and unfindable — the
+/// exact state that makes a correctly-added agent look broken. So the two
+/// happen together. A profile failure is reported, not fatal: the join
+/// itself succeeded, and undoing it would be worse.
+pub fn join_relay_as(
+    relay: &str,
+    code: &str,
+    name: &str,
+    custody: &Custody,
+    agent: &AgentHandle,
+) -> Result<(String, Option<String>), crate::Error> {
+    let joined = join_relay(relay, code, custody, agent)?;
+    let announced = announce(relay, name, custody, agent)
+        .err()
+        .map(|error| error.to_string());
+    Ok((joined, announced))
+}
+
+/// What a relay actually knows about this agent.
+///
+/// Two different things, and conflating them is why an agent that was
+/// correctly added to a relay still could not be found in a channel member
+/// picker. `member` is permission — whether the relay will talk to it at
+/// all. `announced` is identity — whether it has published a kind-0
+/// profile there, which is what pickers and mention autocomplete search.
+/// A member with no profile is connected, reachable, and invisible.
+pub struct Reachability {
+    pub member: bool,
+    pub announced: bool,
+    pub detail: String,
+}
+
+/// Ask the relay both questions, rather than describing them.
+pub fn check_membership(relay: &str, custody: &Custody, agent: &AgentHandle) -> Reachability {
     let mut session = match BuzzSession::connect(relay, custody, agent) {
         Ok(session) => session,
-        Err(error) => return (false, format!("could not reach the relay: {error}")),
+        Err(error) => {
+            return Reachability {
+                member: false,
+                announced: false,
+                detail: format!("could not reach the relay: {error}"),
+            }
+        }
     };
-    match channel_ids(&mut session) {
+    let (member, detail) = match channel_ids(&mut session) {
         Ok(ids) => (
             true,
             format!("reachable — {} channel(s) visible to it", ids.len()),
         ),
         Err(error) => (false, error.to_string()),
+    };
+    let announced = member && has_profile(&mut session, &agent.pubkey().to_hex());
+    Reachability {
+        member,
+        announced,
+        detail,
     }
+}
+
+/// Has this agent published a kind-0 profile on this relay?
+fn has_profile(session: &mut BuzzSession, author_hex: &str) -> bool {
+    session
+        .req(json!({ "kinds": [0], "authors": [author_hex], "limit": 1 }))
+        .map(|events| !events.is_empty())
+        .unwrap_or(false)
+}
+
+/// Publish this agent's kind-0 profile to a relay, so people can find it.
+///
+/// Being a relay member makes an agent reachable; it does not make it
+/// visible. An agent only published a profile as a side effect of its
+/// listener starting — which never happens on a relay its ratified
+/// manifest does not name, and did not happen for an agent added by an
+/// operator out of band.
+pub fn announce(
+    relay: &str,
+    name: &str,
+    custody: &Custody,
+    agent: &AgentHandle,
+) -> Result<String, crate::Error> {
+    let mut session = BuzzSession::connect(relay, custody, agent)?;
+    let event = session.set_profile(name, None, None)?;
+    Ok(event.id.to_hex())
 }
 
 /// The HTTPS origin that answers for a `wss://` relay. Scheme mapping

@@ -3,26 +3,6 @@
 
 use apiary_core::manifest::{KnowledgeHome, Manifest};
 
-fn manifest_with(memory: &str) -> Result<Manifest, apiary_core::Error> {
-    Manifest::from_yaml(&format!(
-        r#"
-manifest_version: 1
-identity:
-  npub: npub1m8mfxnr32mlkylq9s0cj5l6vheatdu39kaze26e65ptzfr8vudgse6kgv3
-inference:
-  - name: brain
-    provider: mock
-routing:
-  default: brain
-memory:
-{memory}
-governance:
-  suspend_keys:
-    - npub1kpmddremcthyftcuua6hjkt9hekc729j78qkhfgfvv35efjz0mnsgddfeg
-"#
-    ))
-}
-
 #[test]
 fn remember_appears_only_where_a_home_was_declared_and_writing_was_granted() {
     let root = std::env::temp_dir().join(format!("apiary-kb-{}", std::process::id()));
@@ -72,7 +52,8 @@ governance:
     };
 
     // Home declared + write granted → remember is offered.
-    let with_home = format!("{vaults}  knowledge_home:\n    vault: TeamKB\n    folder: agent-notes\n");
+    let with_home =
+        format!("{vaults}  knowledge_home:\n    vault: TeamKB\n    folder: agent-notes\n");
     assert!(
         tools_for(&with_home, true).contains(&"remember".to_string()),
         "a declared home in a writable vault gives the agent somewhere to put things"

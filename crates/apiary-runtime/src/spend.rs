@@ -506,7 +506,10 @@ mod tests {
         let refused = l
             .reserve_in_lane(Some(500), None, Lane::Proactive, Some(100_000))
             .expect_err("the daily cap bounds every lane");
-        assert!(refused.to_string().contains("daily token budget"), "{refused}");
+        assert!(
+            refused.to_string().contains("daily token budget"),
+            "{refused}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
