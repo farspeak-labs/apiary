@@ -1,0 +1,11 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.0.0/schema.json",
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": false,
+      "correctness": { "noUndeclaredVariables": "error" }
+    }
+  },
+  "javascript": { "globals": ["window", "document", "location", "fetch", "console", "sessionStorage", "localStorage", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "crypto", "btoa", "atob", "TextEncoder", "URLSearchParams", "Storage", "EventSource", "AbortController", "navigator", "requestAnimationFrame", "alert", "confirm", "Event", "CustomEvent", "FormData", "Blob", "URL", "structuredClone", "queueMicrotask", "performance"] }
+}

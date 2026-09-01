@@ -1776,7 +1776,7 @@ async function relayReachability(c) {
       render();
     };
   }
-  if (!known) {
+  if (!m.member) {
     box.append(help('An agent must be a relay member before anyone can reach it. Paste an invite from the relay and it will join using its own key — nothing about your identity is used, and this host stores no relay admin credential.'));
     const code = el('input');
     code.placeholder = 'invite code from the relay';
