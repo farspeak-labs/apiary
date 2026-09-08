@@ -497,15 +497,73 @@ fn drain_process_output<R: Read + Send + 'static>(
 
 fn parse_harness_action(raw: &str) -> Option<serde_json::Value> {
     let trimmed = raw.trim();
-    if let Ok(value) = serde_json::from_str(trimmed) {
-        return Some(value);
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Some(unwrap_action(value));
     }
     let unfenced = trimmed
         .strip_prefix("```json")
         .or_else(|| trimmed.strip_prefix("```"))?
         .strip_suffix("```")?
         .trim();
-    serde_json::from_str(unfenced).ok()
+    serde_json::from_str::<serde_json::Value>(unfenced)
+        .ok()
+        .map(unwrap_action)
+}
+
+/// Rescue readable text from an envelope we did not understand.
+///
+/// The tool loop has two paths that give up and return the model's raw
+/// output: unparseable, and parsed-but-unrecognized. That output is then
+/// posted verbatim into a chat channel. When it is prose, that is right;
+/// when it is JSON, the person gets machine output where an answer should
+/// be, and the agent looks broken in a way that has nothing to do with
+/// what it actually did.
+///
+/// So before falling back, look for the answer inside. Only a `text`-ish
+/// string one or two levels down counts — this rescues a mis-shaped
+/// envelope without inventing meaning for arbitrary JSON.
+fn salvage_text(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    fn pick(value: &serde_json::Value, depth: usize) -> Option<String> {
+        let object = value.as_object()?;
+        for key in ["text", "answer", "content", "message"] {
+            if let Some(found) = object.get(key).and_then(|v| v.as_str()) {
+                let found = found.trim();
+                if !found.is_empty() {
+                    return Some(found.to_string());
+                }
+            }
+        }
+        if depth == 0 {
+            return None;
+        }
+        object.values().find_map(|inner| pick(inner, depth - 1))
+    }
+    pick(&value, 2)
+}
+
+/// Unwrap `{"final": {...}}` / `{"tool": {...}}` to the action inside.
+///
+/// The contract used to illustrate its two shapes as a map keyed by their
+/// names, and a model reading that quite reasonably echoed the wrapper
+/// back. The action then had no `kind`, the loop fell through to "I do not
+/// understand this", and the entire JSON envelope was returned as the
+/// reply — which is how a chat channel got a wall of
+/// `{"final":{"kind":"final","text":"..."}}` where a draft should have
+/// been. The contract is fixed; this stays, because a model will still
+/// produce the old shape now and then.
+fn unwrap_action(value: serde_json::Value) -> serde_json::Value {
+    if value.get("kind").is_some() {
+        return value;
+    }
+    for key in ["final", "tool"] {
+        if let Some(inner) = value.get(key) {
+            if inner.get("kind").is_some() {
+                return inner.clone();
+            }
+        }
+    }
+    value
 }
 
 /// Subscription-backed inference through the official Claude Code runtime.
@@ -1023,9 +1081,11 @@ impl Provider for ClaudeCodeProvider {
                 "history": history,
                 "remaining_token_authority": budget_tokens - spent,
                 "response_contract": {
-                    "final": {"kind": "final", "text": "final answer"},
-                    "tool": {"kind": "tool", "name": "exact available tool name", "arguments": {}},
-                    "instruction": "Return exactly one JSON object and nothing else. Select at most one tool per turn. Never invent a tool name."
+                    "instruction": "Reply with exactly one JSON object matching ONE of the shapes in one_of, and nothing else. Do not wrap it in another object. Select at most one tool per turn. Never invent a tool name.",
+                    "one_of": [
+                        {"kind": "final", "text": "the complete answer, as the person will read it"},
+                        {"kind": "tool", "name": "exact available tool name", "arguments": {}}
+                    ]
                 }
             });
             let turn = self.invoke(model, &payload)?;
@@ -1033,6 +1093,7 @@ impl Provider for ClaudeCodeProvider {
             output_tokens += turn.output_tokens;
             served_model = turn.model;
             let Some(action) = parse_harness_action(&turn.text) else {
+                // Not JSON at all: prose, which is a fine answer.
                 return Ok(Completion {
                     text: turn.text,
                     model: served_model,
@@ -1070,11 +1131,20 @@ impl Provider for ClaudeCodeProvider {
                         "tool_result": result,
                     }));
                 }
+                // A JSON object we do not recognize. Posting it verbatim
+                // is how a channel gets machine output where an answer
+                // should be, so rescue the readable part if there is one
+                // and record that the shape was wrong either way.
                 _ => {
+                    let salvaged = salvage_text(&turn.text);
                     return Ok(Completion {
-                        text: turn.text,
+                        text: salvaged.clone().unwrap_or(turn.text),
                         model: served_model,
-                        outcome: "ok".into(),
+                        outcome: if salvaged.is_some() {
+                            "ok (recovered from an unrecognized response shape)".into()
+                        } else {
+                            "ok (unrecognized response shape)".into()
+                        },
                         input_tokens,
                         output_tokens,
                     })
@@ -1408,9 +1478,11 @@ impl Provider for CodexProvider {
                     "history": history,
                     "remaining_token_authority": budget_tokens - spent,
                     "response_contract": {
-                        "final": {"kind": "final", "text": "final answer"},
-                        "tool": {"kind": "tool", "name": "exact available tool name", "arguments": {}},
-                        "instruction": "Return exactly one JSON object and nothing else. Select at most one tool per turn. Never call Codex tools or invent an Apiary tool name."
+                        "instruction": "Reply with exactly one JSON object matching ONE of the shapes in one_of, and nothing else. Do not wrap it in another object. Select at most one tool per turn. Never call Codex tools or invent an Apiary tool name.",
+                        "one_of": [
+                            {"kind": "final", "text": "the complete answer, as the person will read it"},
+                            {"kind": "tool", "name": "exact available tool name", "arguments": {}}
+                        ]
                     }
                 }),
             )?;
@@ -1840,9 +1912,11 @@ impl Provider for GrokCodeProvider {
                 "history": history,
                 "remaining_token_authority": budget_tokens - spent,
                 "response_contract": {
-                    "final": {"kind": "final", "text": "final answer"},
-                    "tool": {"kind": "tool", "name": "exact available tool name", "arguments": {}},
-                    "instruction": "Return exactly one JSON object and nothing else. Select at most one tool per turn. Never invent a tool name."
+                    "instruction": "Reply with exactly one JSON object matching ONE of the shapes in one_of, and nothing else. Do not wrap it in another object. Select at most one tool per turn. Never invent a tool name.",
+                    "one_of": [
+                        {"kind": "final", "text": "the complete answer, as the person will read it"},
+                        {"kind": "tool", "name": "exact available tool name", "arguments": {}}
+                    ]
                 }
             });
             let turn = self.invoke(model, &payload)?;
@@ -1850,6 +1924,7 @@ impl Provider for GrokCodeProvider {
             output_tokens += turn.output_tokens;
             served_model = turn.model;
             let Some(action) = parse_harness_action(&turn.text) else {
+                // Not JSON at all: prose, which is a fine answer.
                 return Ok(Completion {
                     text: turn.text,
                     model: served_model,
@@ -1887,11 +1962,20 @@ impl Provider for GrokCodeProvider {
                         "tool_result": result,
                     }));
                 }
+                // A JSON object we do not recognize. Posting it verbatim
+                // is how a channel gets machine output where an answer
+                // should be, so rescue the readable part if there is one
+                // and record that the shape was wrong either way.
                 _ => {
+                    let salvaged = salvage_text(&turn.text);
                     return Ok(Completion {
-                        text: turn.text,
+                        text: salvaged.clone().unwrap_or(turn.text),
                         model: served_model,
-                        outcome: "ok".into(),
+                        outcome: if salvaged.is_some() {
+                            "ok (recovered from an unrecognized response shape)".into()
+                        } else {
+                            "ok (unrecognized response shape)".into()
+                        },
                         input_tokens,
                         output_tokens,
                     })
@@ -2933,6 +3017,51 @@ mod openai_tests {
         .unwrap();
         assert_eq!(fenced["name"], "web_search");
         assert!(parse_harness_action("not json").is_none());
+    }
+
+    /// The exact shape that put a wall of JSON into a chat channel: the
+    /// contract listed its two forms as a map keyed by name, so the model
+    /// returned the map. The action then had no `kind`, the loop did not
+    /// recognize it, and the envelope became the reply.
+    #[test]
+    fn the_wrapper_the_old_contract_taught_is_unwrapped() {
+        let wrapped = r#"{"final":{"kind":"final","text":"Here is the draft."}}"#;
+        let action = parse_harness_action(wrapped).expect("valid json");
+        assert_eq!(action["kind"], "final");
+        assert_eq!(action["text"], "Here is the draft.");
+
+        let wrapped_tool = r#"{"tool":{"kind":"tool","name":"marketing_list","arguments":{}}}"#;
+        let action = parse_harness_action(wrapped_tool).expect("valid json");
+        assert_eq!(action["kind"], "tool");
+        assert_eq!(action["name"], "marketing_list");
+
+        // The correct shape is untouched.
+        let plain = r#"{"kind":"final","text":"ok"}"#;
+        assert_eq!(parse_harness_action(plain).unwrap()["text"], "ok");
+
+        // And a wrapper around something that is not an action is left
+        // alone rather than guessed at.
+        let unrelated = r#"{"final":{"no_kind_here":1}}"#;
+        assert!(parse_harness_action(unrelated).unwrap().get("kind").is_none());
+    }
+
+    /// Whatever shape arrives, a person must not be handed machine output
+    /// where an answer belongs.
+    #[test]
+    fn readable_text_is_rescued_from_an_envelope_we_do_not_understand() {
+        assert_eq!(
+            salvage_text(r#"{"result":{"answer":"the draft body"}}"#).as_deref(),
+            Some("the draft body")
+        );
+        assert_eq!(
+            salvage_text(r#"{"kind":"something_new","text":"still readable"}"#).as_deref(),
+            Some("still readable")
+        );
+        // Nothing readable in there: say so by returning nothing, rather
+        // than picking an arbitrary string.
+        assert!(salvage_text(r#"{"status":{"code":500}}"#).is_none());
+        // Prose is not an envelope and is never touched.
+        assert!(salvage_text("Here is the draft.").is_none());
     }
 
     #[test]
