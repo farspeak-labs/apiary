@@ -500,14 +500,57 @@ fn parse_harness_action(raw: &str) -> Option<serde_json::Value> {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
         return Some(unwrap_action(value));
     }
-    let unfenced = trimmed
+    if let Some(unfenced) = trimmed
         .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))?
-        .strip_suffix("```")?
-        .trim();
-    serde_json::from_str::<serde_json::Value>(unfenced)
-        .ok()
-        .map(unwrap_action)
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|rest| rest.strip_suffix("```"))
+    {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(unfenced.trim()) {
+            return Some(unwrap_action(value));
+        }
+    }
+    embedded_action(trimmed)
+}
+
+/// Find an action inside output that also contains prose.
+///
+/// The contract says "and nothing else", and models narrate anyway: "I'll
+/// verify that claim first" and then the tool call. Parsing the whole
+/// string fails, so the turn was treated as a plain answer — the tool
+/// never ran, and the JSON was posted into the channel underneath the
+/// narration.
+///
+/// Scanning is bounded by requiring a recognized `kind`, so an object that
+/// merely appears in prose is not mistaken for an instruction, and the
+/// nested `arguments` object inside a real action cannot match either.
+fn embedded_action(text: &str) -> Option<serde_json::Value> {
+    // Only a brace that begins a block is a candidate: an action is
+    // emitted on its own, while `"arguments":{` and braces inside prose
+    // are preceded by other characters. This is also what keeps the scan
+    // cheap on a long answer that happens to contain a lot of JSON.
+    const MAX_CANDIDATES: usize = 32;
+    let candidates = text
+        .char_indices()
+        .filter(|(index, c)| {
+            *c == '{'
+                && text[..*index]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|previous| previous.is_whitespace())
+        })
+        .take(MAX_CANDIDATES);
+    for (start, _) in candidates {
+        let mut stream =
+            serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
+        let Some(Ok(value)) = stream.next() else {
+            continue;
+        };
+        let action = unwrap_action(value);
+        if matches!(action["kind"].as_str(), Some("final") | Some("tool")) {
+            return Some(action);
+        }
+    }
+    None
 }
 
 /// Rescue readable text from an envelope we did not understand.
@@ -3043,6 +3086,39 @@ mod openai_tests {
         // alone rather than guessed at.
         let unrelated = r#"{"final":{"no_kind_here":1}}"#;
         assert!(parse_harness_action(unrelated).unwrap().get("kind").is_none());
+    }
+
+    /// The exact message a channel received: narration, then the tool
+    /// call. Parsing the whole string failed, so the turn looked like a
+    /// plain answer — the search never ran and the JSON was posted under
+    /// the sentence explaining why it was about to run.
+    #[test]
+    fn an_action_is_found_even_when_the_model_narrates_first() {
+        let mixed = "I'll verify the \"packaging inventory\" claim before using their \
+                     wording, since it's not in the standard job list I've been drafting \
+                     from.\n\n{\"kind\":\"tool\",\"name\":\"mcp_marketing_search\",\
+                     \"arguments\":{\"query\":\"packaging inventory\",\"includeDrafts\":true,\
+                     \"limit\":10}}";
+        let action = parse_harness_action(mixed).expect("the action is in there");
+        assert_eq!(action["kind"], "tool");
+        assert_eq!(action["name"], "mcp_marketing_search");
+        assert_eq!(action["arguments"]["query"], "packaging inventory");
+
+        // A final answer after narration is found the same way.
+        let after = "Thinking about it now.\n{\"kind\":\"final\",\"text\":\"the draft\"}";
+        assert_eq!(parse_harness_action(after).unwrap()["text"], "the draft");
+    }
+
+    /// The scan must not turn ordinary writing into an instruction. Prose
+    /// that merely contains braces, JSON, or the word "tool" is an answer.
+    #[test]
+    fn prose_containing_json_is_still_prose() {
+        assert!(parse_harness_action("Set it to {\"limit\": 10} in the config.").is_none());
+        assert!(parse_harness_action("Use {\"name\":\"whatever\"} as the payload.").is_none());
+        assert!(parse_harness_action("No braces at all here.").is_none());
+        // An unrecognized kind is not an action either.
+        assert!(parse_harness_action("{\"kind\":\"musing\",\"text\":\"hm\"}")
+            .is_some_and(|a| a["kind"] == "musing"));
     }
 
     /// Whatever shape arrives, a person must not be handed machine output
