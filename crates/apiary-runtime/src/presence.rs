@@ -180,6 +180,14 @@ pub trait ChannelAdapter {
     /// a second one. `voice` picks the honest verb where a platform has
     /// one — recording, not typing.
     ///
+    /// Say the agent is leaving, on a clean stop.
+    ///
+    /// Presence expires on its own, so this is not required for
+    /// correctness — it is the difference between going dark immediately
+    /// and looking available for another few minutes to someone deciding
+    /// whether to ask.
+    fn going_offline(&mut self) {}
+
     /// Default: none. A platform with no such affordance is quiet, not
     /// broken.
     fn typing<'a>(&'a mut self, _channel: &str, _voice: bool) -> Option<Box<dyn TypingPulse + 'a>> {
@@ -205,16 +213,19 @@ pub fn run_presence(
     sink(adapter.describe());
     loop {
         if stop.load(Ordering::Relaxed) {
+            adapter.going_offline();
             return Ok(());
         }
         let mention = match adapter.next_mention(stop) {
             Ok(Some(m)) => m,
             Ok(None) => {
                 if stop.load(Ordering::Relaxed) {
+                    adapter.going_offline();
                     return Ok(());
                 }
                 if !on_tick()? {
                     sink(format!("{kind}: stopping (tick said stop)"));
+                    adapter.going_offline();
                     return Ok(());
                 }
                 continue;

@@ -100,6 +100,17 @@ pub const KIND_TYPING_INDICATOR: u16 = 20002;
 /// AS an agent is this separate, replaceable, pubkey-keyed event.
 pub const KIND_AGENT_PROFILE: u16 = 10100;
 
+/// Buzz's ephemeral presence update. Content is a bare status string —
+/// "online", "away", "offline" — and the relay holds it in Redis under a
+/// TTL of three heartbeats. That TTL is the whole design: an agent is
+/// present because it keeps saying so, and goes dark on its own when it
+/// stops, without anything having to notice that it died.
+pub const KIND_PRESENCE_UPDATE: u16 = 20001;
+
+/// Match Buzz's own clients. The relay's TTL is derived from this, so
+/// beating slower than the relay expects reads as flapping.
+pub const PRESENCE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub const KIND_AUTH: u16 = 22242;
 /// NIP-29 group/channel metadata kind (channel discovery).
 pub const KIND_GROUP_METADATA: u16 = 39000;
@@ -460,6 +471,14 @@ impl<'a> BuzzSession<'a> {
         Ok(event)
     }
 
+    /// Say whether this agent is available for conversation.
+    pub fn set_presence(&mut self, status: &str) -> Result<(), crate::Error> {
+        let builder = EventBuilder::new(Kind::Custom(KIND_PRESENCE_UPDATE), status);
+        let event = self.custody.sign(self.agent, builder)?;
+        self.publish(&event)?;
+        Ok(())
+    }
+
     /// Ask to join a channel (NIP-29 kind 9021). Open channels admit
     /// immediately; private ones queue for an admin.
     pub fn join_channel(&mut self, channel_uuid: &str) -> Result<Event, crate::Error> {
@@ -700,6 +719,8 @@ pub struct BuzzAdapter<'a> {
     /// channels once at connect, so a channel created afterwards — including
     /// a DM someone opens with the agent — is invisible until it restarts.
     channels_checked: std::time::Instant,
+    /// When this agent last said it was here.
+    presence_beat: std::time::Instant,
 }
 
 impl<'a> BuzzAdapter<'a> {
@@ -758,6 +779,9 @@ impl<'a> BuzzAdapter<'a> {
                 eprintln!("buzz: could not publish agent profile for {name}: {e}");
             }
         }
+        if let Err(e) = session.set_presence("online") {
+            eprintln!("buzz: could not announce presence: {e}");
+        }
         let channels = channel_ids(&mut session)?;
         let recent = RecentEventIds::load(cursor_path.as_deref());
         Ok(Self {
@@ -770,6 +794,7 @@ impl<'a> BuzzAdapter<'a> {
             cursor_path,
             recent,
             channels_checked: std::time::Instant::now(),
+            presence_beat: std::time::Instant::now(),
         })
     }
 }
@@ -1118,6 +1143,10 @@ impl crate::presence::ChannelAdapter for BuzzAdapter<'_> {
         "buzz"
     }
 
+    fn going_offline(&mut self) {
+        let _ = self.session.set_presence("offline");
+    }
+
     fn typing<'a>(
         &'a mut self,
         channel: &str,
@@ -1165,6 +1194,13 @@ impl crate::presence::ChannelAdapter for BuzzAdapter<'_> {
         // over, so it is logged and the existing subscription carries on.
         if let Err(e) = self.refresh_channels() {
             eprintln!("buzz: could not refresh channel list: {e}");
+        }
+        // Presence is a claim with an expiry, so it has to be repeated. A
+        // failed beat is not worth a word: the next one is a minute away
+        // and the relay's TTL is three.
+        if self.presence_beat.elapsed() >= PRESENCE_HEARTBEAT {
+            self.presence_beat = std::time::Instant::now();
+            let _ = self.session.set_presence("online");
         }
         loop {
             match self
