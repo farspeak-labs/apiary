@@ -94,6 +94,12 @@ pub const KIND_STREAM_MESSAGE: u16 = 9;
 /// is a heartbeat rather than a state to set and clear.
 pub const KIND_TYPING_INDICATOR: u16 = 20002;
 
+/// Buzz's agent profile. A kind-0 makes a key a USER with a display name —
+/// enough to hold a conversation, which is why an agent can answer in a
+/// channel and still be missing from every agent list. Being discoverable
+/// AS an agent is this separate, replaceable, pubkey-keyed event.
+pub const KIND_AGENT_PROFILE: u16 = 10100;
+
 pub const KIND_AUTH: u16 = 22242;
 /// NIP-29 group/channel metadata kind (channel discovery).
 pub const KIND_GROUP_METADATA: u16 = 39000;
@@ -416,6 +422,30 @@ impl<'a> BuzzSession<'a> {
         Ok(event)
     }
 
+    /// Publish the kind-10100 agent profile Buzz discovers agents from.
+    ///
+    /// Content is the agent's own description of itself; the relay keys the
+    /// event by pubkey and clients fill in what is absent. `status` is
+    /// deliberately omitted — a replaceable event written at connect would
+    /// still claim "online" long after the process died, and Buzz has live
+    /// presence signals that are actually live.
+    pub fn set_agent_profile(
+        &mut self,
+        name: &str,
+        capabilities: &[String],
+    ) -> Result<Event, crate::Error> {
+        let profile = json!({
+            "name": name,
+            "display_name": name,
+            "agent_type": "agent",
+            "capabilities": capabilities,
+        });
+        let builder = EventBuilder::new(Kind::Custom(KIND_AGENT_PROFILE), profile.to_string());
+        let event = self.custody.sign(self.agent, builder)?;
+        self.publish(&event)?;
+        Ok(event)
+    }
+
     /// Ask to join a channel (NIP-29 kind 9021). Open channels admit
     /// immediately; private ones queue for an admin.
     pub fn join_channel(&mut self, channel_uuid: &str) -> Result<Event, crate::Error> {
@@ -679,7 +709,7 @@ impl<'a> BuzzAdapter<'a> {
         trigger: String,
         cursor_path: Option<std::path::PathBuf>,
     ) -> Result<Self, crate::Error> {
-        Self::connect_as(relay, custody, handle, trigger, cursor_path, None)
+        Self::connect_as(relay, custody, handle, trigger, cursor_path, None, &[])
     }
 
     /// Connect, and publish the agent's kind-0 profile so people see a NAME
@@ -697,12 +727,21 @@ impl<'a> BuzzAdapter<'a> {
         trigger: String,
         cursor_path: Option<std::path::PathBuf>,
         display_name: Option<&str>,
+        capabilities: &[String],
     ) -> Result<Self, crate::Error> {
         let mut session = BuzzSession::connect(relay, custody, handle)?;
         session.enable_keepalive(std::time::Duration::from_secs(15));
         if let Some(name) = display_name.map(str::trim).filter(|n| !n.is_empty()) {
+            // Two events, because Buzz asks two questions. kind-0 is "who is
+            // this key" and is what lets it hold a conversation; kind-10100
+            // is "this is an agent" and is what every agent list reads. An
+            // agent with only the first answers when spoken to and appears
+            // in no directory — which looks like being broken and is not.
             if let Err(e) = session.set_profile(name, None, None) {
                 eprintln!("buzz: could not publish profile for {name}: {e}");
+            }
+            if let Err(e) = session.set_agent_profile(name, capabilities) {
+                eprintln!("buzz: could not publish agent profile for {name}: {e}");
             }
         }
         let channels = channel_ids(&mut session)?;
@@ -821,11 +860,12 @@ pub fn join_relay_as(
     relay: &str,
     code: &str,
     name: &str,
+    capabilities: &[String],
     custody: &Custody,
     agent: &AgentHandle,
 ) -> Result<(String, Option<String>), crate::Error> {
     let joined = join_relay(relay, code, custody, agent)?;
-    let announced = announce(relay, name, custody, agent)
+    let announced = announce(relay, name, capabilities, custody, agent)
         .err()
         .map(|error| error.to_string());
     Ok((joined, announced))
@@ -864,7 +904,8 @@ pub fn check_membership(relay: &str, custody: &Custody, agent: &AgentHandle) -> 
         ),
         Err(error) => (false, error.to_string()),
     };
-    let announced = member && has_profile(&mut session, &agent.pubkey().to_hex());
+    // Findable means findable AS AN AGENT: a kind-0 alone is a user.
+    let announced = member && has_agent_profile(&mut session, &agent.pubkey().to_hex());
     Reachability {
         member,
         announced,
@@ -872,10 +913,14 @@ pub fn check_membership(relay: &str, custody: &Custody, agent: &AgentHandle) -> 
     }
 }
 
-/// Has this agent published a kind-0 profile on this relay?
-fn has_profile(session: &mut BuzzSession, author_hex: &str) -> bool {
+/// Has this agent published the agent profile Buzz discovers agents from?
+fn has_agent_profile(session: &mut BuzzSession, author_hex: &str) -> bool {
     session
-        .req(json!({ "kinds": [0], "authors": [author_hex], "limit": 1 }))
+        .req(json!({
+            "kinds": [KIND_AGENT_PROFILE],
+            "authors": [author_hex],
+            "limit": 1
+        }))
         .map(|events| !events.is_empty())
         .unwrap_or(false)
 }
@@ -890,11 +935,14 @@ fn has_profile(session: &mut BuzzSession, author_hex: &str) -> bool {
 pub fn announce(
     relay: &str,
     name: &str,
+    capabilities: &[String],
     custody: &Custody,
     agent: &AgentHandle,
 ) -> Result<String, crate::Error> {
     let mut session = BuzzSession::connect(relay, custody, agent)?;
     let event = session.set_profile(name, None, None)?;
+    // The agent profile is the half that makes it findable AS an agent.
+    session.set_agent_profile(name, capabilities)?;
     Ok(event.id.to_hex())
 }
 

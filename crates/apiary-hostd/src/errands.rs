@@ -48,6 +48,18 @@ fn delivery_to(errand: &Errand) -> Option<Delivery> {
     Some(target)
 }
 
+/// What an agent tells a relay it can do: the names of its ratified skills.
+///
+/// Honest by construction — it is the same list the runner selects from, so
+/// an agent cannot advertise a competence its manifest does not grant.
+pub(crate) fn advertised_capabilities(manifest: &Manifest) -> Vec<String> {
+    manifest
+        .skills
+        .iter()
+        .map(|skill| skill.name.clone())
+        .collect()
+}
+
 /// One supervisor tick over every agent's outstanding work.
 pub fn reconcile_errands(state: &App) {
     let Ok(ks) = Keystore::open(&state.home) else {
@@ -565,8 +577,9 @@ pub async fn join_relay(
     } else {
         name
     };
+    let caps = advertised_capabilities(&manifest);
     let outcome = tokio::task::spawn_blocking(move || {
-        apiary_runtime::buzz::join_relay_as(&relay, &body.code, &name, &custody, &handle)
+        apiary_runtime::buzz::join_relay_as(&relay, &body.code, &name, &caps, &custody, &handle)
             .map(|response| (relay, response, custody, handle))
     })
     .await;
@@ -660,8 +673,9 @@ pub async fn announce_profile(
         }
     };
     let relay2 = relay.clone();
+    let caps = advertised_capabilities(&manifest);
     let published = tokio::task::spawn_blocking(move || {
-        apiary_runtime::buzz::announce(&relay2, &name, &custody, &handle)
+        apiary_runtime::buzz::announce(&relay2, &name, &caps, &custody, &handle)
     })
     .await;
     match published {
