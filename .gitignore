@@ -8,7 +8,5 @@ state/
 
 # Per-agent deployment records live outside this repo: together they map a
 # real host (endpoints, tool inventories, relay names, filesystem layout),
-# and this repo is public. See ../Apiary-ops.
-docs/bloom/
-docs/forge/
-docs/scout/
+# and this repo is public. Keep them beside the checkout, not in it.
+docs/agents/
