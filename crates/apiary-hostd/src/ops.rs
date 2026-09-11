@@ -5353,6 +5353,7 @@ fn spawn_channel(
                     // as itself rather than a hex pubkey, and AS AN AGENT, so
                     // it appears in agent lists at all.
                     let capabilities = crate::errands::advertised_capabilities(&manifest);
+                    let avatar = apiary_runtime::buzz::remembered_avatar(&dir);
                     Box::new(apiary_runtime::buzz::BuzzAdapter::connect_as(
                         &relay,
                         &custody,
@@ -5361,6 +5362,7 @@ fn spawn_channel(
                         Some(dir.join("presence").join("buzz-recent.json")),
                         Some(name.as_str()),
                         &capabilities,
+                        avatar.as_deref(),
                     )?)
                 }
                 "telegram" => {

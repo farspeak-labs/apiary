@@ -744,7 +744,16 @@ impl<'a> BuzzAdapter<'a> {
         trigger: String,
         cursor_path: Option<std::path::PathBuf>,
     ) -> Result<Self, crate::Error> {
-        Self::connect_as(relay, custody, handle, trigger, cursor_path, None, &[])
+        Self::connect_as(
+            relay,
+            custody,
+            handle,
+            trigger,
+            cursor_path,
+            None,
+            &[],
+            None,
+        )
     }
 
     /// Connect, and publish the agent's kind-0 profile so people see a NAME
@@ -763,6 +772,7 @@ impl<'a> BuzzAdapter<'a> {
         cursor_path: Option<std::path::PathBuf>,
         display_name: Option<&str>,
         capabilities: &[String],
+        picture: Option<&str>,
     ) -> Result<Self, crate::Error> {
         let mut session = BuzzSession::connect(relay, custody, handle)?;
         session.enable_keepalive(std::time::Duration::from_secs(15));
@@ -772,10 +782,14 @@ impl<'a> BuzzAdapter<'a> {
             // is "this is an agent" and is what every agent list reads. An
             // agent with only the first answers when spoken to and appears
             // in no directory — which looks like being broken and is not.
-            if let Err(e) = session.set_profile(name, None, None) {
+            // The picture has to be carried, not omitted. kind-0 is
+            // REPLACEABLE, so publishing one without a picture does not
+            // leave the old avatar alone — it erases it, and every restart
+            // would quietly undo the avatars someone set.
+            if let Err(e) = session.set_profile(name, None, picture) {
                 eprintln!("buzz: could not publish profile for {name}: {e}");
             }
-            if let Err(e) = session.set_agent_profile(name, capabilities, None) {
+            if let Err(e) = session.set_agent_profile(name, capabilities, picture) {
                 eprintln!("buzz: could not publish agent profile for {name}: {e}");
             }
         }
@@ -904,6 +918,20 @@ pub fn upload_blob(
                 text.chars().take(200).collect::<String>()
             ))
         })
+}
+
+/// Where an agent's avatar URL is remembered, so a reconnect can
+/// republish it instead of erasing it.
+pub fn avatar_path(agent_dir: &std::path::Path) -> std::path::PathBuf {
+    agent_dir.join("presence").join("avatar")
+}
+
+/// The avatar this agent last published, if any.
+pub fn remembered_avatar(agent_dir: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(avatar_path(agent_dir))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Publish both profiles with a picture, as one act.

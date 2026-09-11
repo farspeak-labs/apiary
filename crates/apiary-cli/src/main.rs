@@ -951,6 +951,15 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                         None => None,
                     };
                     let picture = uploaded.as_deref().or(picture.as_deref());
+                    // Remember it: the listener republishes kind-0 on every
+                    // reconnect, and a kind-0 without a picture erases one.
+                    if let Some(url) = picture {
+                        let path = apiary_runtime::buzz::avatar_path(&agent_dir);
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::write(path, url)?;
+                    }
                     let event = session.set_profile(name, about.as_deref(), picture)?;
                     // The agent profile carries the picture too: kind-0 is
                     // how a user is shown, kind-10100 is how an AGENT is
