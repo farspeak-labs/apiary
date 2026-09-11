@@ -189,6 +189,12 @@ proactive allowance is inert and says so on the Watches endpoint.
 that chose not to look are different problems with the same symptom, and
 asking the agent tells you nothing — it answers from its prompt.
 
+**A tool policy of `read-write` does not mean the tool writes.** That flag
+governs whether Apiary will call a tool the server did not declare read-only.
+It cannot add an operation the server does not have — a catalogue whose verbs
+are all `get`, `list`, `search` and `lookup` is read-only however it is
+ticked. Read the tool NAMES before promising an agent can write anywhere.
+
 **Agent claims it lacks access it has** → same check. Trust the log, not the
 agent's self-report.
 

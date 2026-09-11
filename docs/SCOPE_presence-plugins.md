@@ -20,7 +20,7 @@ Inbound presence — living on a platform and answering when spoken to — has n
 ```yaml
 presence:
   buzz:
-    relay: wss://buzz.wisco.wine        # config keys are per-kind
+    relay: wss://relay.example.com      # config keys are per-kind
   telegram:
     credential: <nip44-sealed bot token> # sealed to the agent, as ever
     allowed_chats: ["123456789"]
