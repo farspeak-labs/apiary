@@ -189,6 +189,21 @@ proactive allowance is inert and says so on the Watches endpoint.
 that chose not to look are different problems with the same symptom, and
 asking the agent tells you nothing — it answers from its prompt.
 
+**A capability that cannot bind fails the whole run, not just itself.**
+Connectors are bound before inference, and `bind_connectors_in` returns an
+error rather than skipping a broken one — so a half-configured capability
+stops the agent answering anything at all. Two that bite:
+
+- `web-search` **errors without its Brave API key**. Never add it as a
+  placeholder ahead of the credential.
+- `mcp` **connects at bind time** to list tools, so an entry with a URL and
+  tools but no sealed credential 401s and takes every run down with it. The
+  one safe way to stage one is with an empty `allowed_tools`: that returns
+  early, before connecting, which is why an empty allowlist is valid-but-inert
+  rather than an error.
+
+Grant the credential and the tools together, or stage neither.
+
 **A tool policy of `read-write` does not mean the tool writes.** That flag
 governs whether Apiary will call a tool the server did not declare read-only.
 It cannot add an operation the server does not have — a catalogue whose verbs
