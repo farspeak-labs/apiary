@@ -255,6 +255,11 @@ enum BuzzCmd {
         about: Option<String>,
         #[arg(long)]
         picture: Option<String>,
+        /// A local image to upload to the relay and use as the picture.
+        /// An avatar is a URL, not an upload, so this does the upload part
+        /// first and then points both profiles at what came back.
+        #[arg(long)]
+        image: Option<std::path::PathBuf>,
     },
     /// Request to join a channel (NIP-29) so mentions and member lists work.
     Join {
@@ -916,9 +921,46 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                     name,
                     about,
                     picture,
+                    image,
                     ..
                 } => {
-                    let event = session.set_profile(name, about.as_deref(), picture.as_deref())?;
+                    let uploaded = match image {
+                        Some(path) => {
+                            let bytes = std::fs::read(path)?;
+                            let mime = match path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .map(str::to_ascii_lowercase)
+                                .as_deref()
+                            {
+                                Some("png") => "image/png",
+                                Some("jpg") | Some("jpeg") => "image/jpeg",
+                                Some("webp") => "image/webp",
+                                Some("gif") => "image/gif",
+                                other => {
+                                    return Err(apiary_core::Error::Manifest(format!(
+                                        "unsupported image type {other:?} — png, jpeg, webp or gif"
+                                    ))
+                                    .into())
+                                }
+                            };
+                            Some(apiary_runtime::buzz::upload_blob(
+                                relay, &bytes, mime, &custody, &handle,
+                            )?)
+                        }
+                        None => None,
+                    };
+                    let picture = uploaded.as_deref().or(picture.as_deref());
+                    let event = session.set_profile(name, about.as_deref(), picture)?;
+                    // The agent profile carries the picture too: kind-0 is
+                    // how a user is shown, kind-10100 is how an AGENT is
+                    // shown, and an avatar on only one of them is half done.
+                    let skills = std::fs::read_to_string(agent_dir.join("manifest.yaml"))
+                        .ok()
+                        .and_then(|raw| apiary_core::manifest::Manifest::from_yaml(&raw).ok())
+                        .map(|m| m.skills.iter().map(|s| s.name.clone()).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    session.set_agent_profile(name, &skills, picture)?;
                     let log = EpisodicLog::open(&agent_dir);
                     log.append(
                         &custody,
@@ -942,6 +984,7 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                         "relay": relay,
                         "name": name,
                         "event": event.id.to_hex(),
+                        "picture": picture,
                     }))
                 }
             }

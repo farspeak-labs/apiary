@@ -433,13 +433,27 @@ impl<'a> BuzzSession<'a> {
         &mut self,
         name: &str,
         capabilities: &[String],
+        picture: Option<&str>,
     ) -> Result<Event, crate::Error> {
-        let profile = json!({
+        // `status` and `channels` are required by the shape Buzz
+        // deserializes relay agents into, and an agent profile missing them
+        // can be dropped on the floor rather than shown. "online" is the
+        // honest reading of a listener that is connected right now: Buzz
+        // treats presence as available-for-conversation, and this event is
+        // republished every time the listener reconnects.
+        let mut profile = json!({
             "name": name,
             "display_name": name,
             "agent_type": "agent",
             "capabilities": capabilities,
+            "status": "online",
+            "channels": [],
+            "channel_ids": [],
         });
+        if let Some(url) = picture {
+            profile["picture"] = json!(url);
+            profile["avatar_url"] = json!(url);
+        }
         let builder = EventBuilder::new(Kind::Custom(KIND_AGENT_PROFILE), profile.to_string());
         let event = self.custody.sign(self.agent, builder)?;
         self.publish(&event)?;
@@ -740,7 +754,7 @@ impl<'a> BuzzAdapter<'a> {
             if let Err(e) = session.set_profile(name, None, None) {
                 eprintln!("buzz: could not publish profile for {name}: {e}");
             }
-            if let Err(e) = session.set_agent_profile(name, capabilities) {
+            if let Err(e) = session.set_agent_profile(name, capabilities, None) {
                 eprintln!("buzz: could not publish agent profile for {name}: {e}");
             }
         }
@@ -790,6 +804,96 @@ impl BuzzAdapter<'_> {
         self.session.subscribe_channels(&channels)?;
         Ok(())
     }
+}
+
+/// Upload bytes to the relay's Blossom store, signed as the agent.
+///
+/// An avatar in Buzz is a URL, not an upload — `picture` on the profile —
+/// so an agent with a picture needs somewhere to have put it first. This
+/// is that somewhere, on the relay the agent already belongs to, holding
+/// nothing but its own key.
+///
+/// BUD-02: `PUT /upload`, a kind-24242 auth event naming the verb and the
+/// hash, and the hash again in a header so the relay can reject a mismatch
+/// before it buffers the body.
+pub fn upload_blob(
+    relay: &str,
+    bytes: &[u8],
+    mime: &str,
+    custody: &Custody,
+    agent: &AgentHandle,
+) -> Result<String, crate::Error> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    let hash = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let expiration = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+        + 300)
+        .to_string();
+    let builder = EventBuilder::new(Kind::Custom(24242), "Upload")
+        .tag(Tag::custom("t", vec!["upload".to_string()]))
+        .tag(Tag::custom("expiration", vec![expiration]))
+        .tag(Tag::custom("x", vec![hash.clone()]));
+    let event = custody.sign(agent, builder)?;
+    let authorization = format!(
+        "Nostr {}",
+        base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_string(&event)
+                .map_err(|e| crate::Error::Provider(format!("blossom auth encode: {e}")))?
+        )
+    );
+
+    let base = http_base(relay)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| crate::Error::Provider(format!("http client: {e}")))?;
+    let response = client
+        .put(format!("{base}/upload"))
+        .header(reqwest::header::AUTHORIZATION, authorization)
+        .header("X-SHA-256", &hash)
+        .header(reqwest::header::CONTENT_TYPE, mime)
+        .body(bytes.to_vec())
+        .send()
+        .map_err(|e| crate::Error::Provider(format!("blossom upload: {e}")))?;
+    let status = response.status();
+    let text = response.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(crate::Error::Provider(format!(
+            "relay refused the upload ({status}): {}",
+            text.chars().take(200).collect::<String>()
+        )));
+    }
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v["url"].as_str().map(str::to_string))
+        .ok_or_else(|| {
+            crate::Error::Provider(format!(
+                "upload succeeded but the relay returned no url: {}",
+                text.chars().take(200).collect::<String>()
+            ))
+        })
+}
+
+/// Publish both profiles with a picture, as one act.
+pub fn set_avatar(
+    relay: &str,
+    name: &str,
+    capabilities: &[String],
+    picture: &str,
+    custody: &Custody,
+    agent: &AgentHandle,
+) -> Result<(), crate::Error> {
+    let mut session = BuzzSession::connect(relay, custody, agent)?;
+    session.set_profile(name, None, Some(picture))?;
+    session.set_agent_profile(name, capabilities, Some(picture))?;
+    Ok(())
 }
 
 /// Join a relay by claiming an invite, signing as the agent itself.
@@ -942,7 +1046,7 @@ pub fn announce(
     let mut session = BuzzSession::connect(relay, custody, agent)?;
     let event = session.set_profile(name, None, None)?;
     // The agent profile is the half that makes it findable AS an agent.
-    session.set_agent_profile(name, capabilities)?;
+    session.set_agent_profile(name, capabilities, None)?;
     Ok(event.id.to_hex())
 }
 
