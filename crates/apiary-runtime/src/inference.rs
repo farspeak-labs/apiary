@@ -1190,7 +1190,7 @@ impl Provider for ClaudeCodeProvider {
                         },
                         input_tokens,
                         output_tokens,
-                    })
+                    });
                 }
             }
         }
@@ -2021,7 +2021,7 @@ impl Provider for GrokCodeProvider {
                         },
                         input_tokens,
                         output_tokens,
-                    })
+                    });
                 }
             }
         }
@@ -3085,7 +3085,10 @@ mod openai_tests {
         // And a wrapper around something that is not an action is left
         // alone rather than guessed at.
         let unrelated = r#"{"final":{"no_kind_here":1}}"#;
-        assert!(parse_harness_action(unrelated).unwrap().get("kind").is_none());
+        assert!(parse_harness_action(unrelated)
+            .unwrap()
+            .get("kind")
+            .is_none());
     }
 
     /// The exact message a channel received: narration, then the tool
@@ -3117,8 +3120,10 @@ mod openai_tests {
         assert!(parse_harness_action("Use {\"name\":\"whatever\"} as the payload.").is_none());
         assert!(parse_harness_action("No braces at all here.").is_none());
         // An unrecognized kind is not an action either.
-        assert!(parse_harness_action("{\"kind\":\"musing\",\"text\":\"hm\"}")
-            .is_some_and(|a| a["kind"] == "musing"));
+        assert!(
+            parse_harness_action("{\"kind\":\"musing\",\"text\":\"hm\"}")
+                .is_some_and(|a| a["kind"] == "musing")
+        );
     }
 
     /// Whatever shape arrives, a person must not be handed machine output
