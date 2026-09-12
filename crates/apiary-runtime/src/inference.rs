@@ -565,6 +565,33 @@ fn embedded_action(text: &str) -> Option<serde_json::Value> {
 /// So before falling back, look for the answer inside. Only a `text`-ish
 /// string one or two levels down counts — this rescues a mis-shaped
 /// envelope without inventing meaning for arbitrary JSON.
+/// A tool call the model wrote as prose instead of as the contract's JSON.
+///
+/// `tool call: web_fetch | {"url":"…"}` is not JSON, so the action parser
+/// returns None and the loop used to treat it as "prose, which is a fine
+/// answer" — publishing it to a chat channel and recording the run `ok`.
+/// The signature is a granted tool NAME with a brace or paren right behind
+/// it; ordinary prose mentioning a tool ("I used web_fetch to check") has
+/// no such adjacency, so it still reads as the answer it is.
+fn attempted_tool_call(text: &str, tool_names: &[String]) -> Option<String> {
+    let text = text.trim();
+    if text.len() > 600 {
+        return None;
+    }
+    for name in tool_names {
+        let mut from = 0;
+        while let Some(at) = text[from..].find(name.as_str()) {
+            let start = from + at + name.len();
+            let window: String = text[start..].chars().take(12).collect();
+            if window.contains('{') || window.contains('(') {
+                return Some(name.clone());
+            }
+            from = start;
+        }
+    }
+    None
+}
+
 fn salvage_text(raw: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
     fn pick(value: &serde_json::Value, depth: usize) -> Option<String> {
@@ -1105,6 +1132,8 @@ impl Provider for ClaudeCodeProvider {
         let mut history = Vec::<serde_json::Value>::new();
         let (mut input_tokens, mut output_tokens) = (0_u64, 0_u64);
         let mut served_model = model.to_string();
+        let tool_names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
+        let mut asked_again = false;
 
         for _ in 0..MAX_ITERATIONS {
             let spent = input_tokens + output_tokens;
@@ -1136,6 +1165,29 @@ impl Provider for ClaudeCodeProvider {
             output_tokens += turn.output_tokens;
             served_model = turn.model;
             let Some(action) = parse_harness_action(&turn.text) else {
+                // Three outcomes, not two. A turn that is neither a valid
+                // action nor an answer is a malformed action, and the one
+                // thing never to do with it is say it out loud.
+                if let Some(name) = attempted_tool_call(&turn.text, &tool_names) {
+                    if !asked_again {
+                        asked_again = true;
+                        history.push(json!({
+                            "assistant_unusable_reply": turn.text,
+                            "correction": format!("That named the tool '{name}' in prose. It was NOT executed. Reply again with exactly one JSON object from the response contract: a tool action to call it, or a final action that answers without it."),
+                        }));
+                        continue;
+                    }
+                    // Twice is not a slip. Withhold it and say so in the
+                    // record, rather than publishing machine output and
+                    // calling the run ok.
+                    return Ok(Completion {
+                        text: String::new(),
+                        model: served_model,
+                        outcome: "refused to publish a malformed tool call".into(),
+                        input_tokens,
+                        output_tokens,
+                    });
+                }
                 // Not JSON at all: prose, which is a fine answer.
                 return Ok(Completion {
                     text: turn.text,
@@ -2637,6 +2689,55 @@ impl Provider for MockProvider {
     }
 }
 
+/// Mock that returns the SYSTEM prompt as its text, so a test can assert
+/// what the model was actually told rather than what we meant to tell it.
+pub struct MockSystemEchoProvider;
+
+impl Provider for MockSystemEchoProvider {
+    fn complete(
+        &self,
+        model: &str,
+        system: &str,
+        _prompt: &str,
+        _images: &[ImageInput],
+        _max_tokens: u64,
+    ) -> Result<Completion, crate::Error> {
+        Ok(Completion {
+            text: system.to_string(),
+            model: model.to_string(),
+            outcome: "ok".into(),
+            input_tokens: 1,
+            output_tokens: 1,
+        })
+    }
+}
+
+/// Mock that serves a model other than the one it was asked for — the
+/// behaviour a real CLI shows when it silently substitutes. Exists so the
+/// divergence check has something honest to catch.
+pub struct MockDowngradeProvider;
+
+pub const MOCK_DOWNGRADE_MODEL: &str = "mock-downgraded-model";
+
+impl Provider for MockDowngradeProvider {
+    fn complete(
+        &self,
+        _model: &str,
+        _system: &str,
+        prompt: &str,
+        _images: &[ImageInput],
+        _max_tokens: u64,
+    ) -> Result<Completion, crate::Error> {
+        Ok(Completion {
+            text: format!("[downgraded] {prompt}"),
+            model: MOCK_DOWNGRADE_MODEL.to_string(),
+            outcome: "ok".into(),
+            input_tokens: prompt.len() as u64 / 4,
+            output_tokens: 16,
+        })
+    }
+}
+
 /// Mock that exercises the tool path: calls each tool once (first required
 /// property = the prompt), then reports the results. Tests the full
 /// dispatch + logging pipeline without a network.
@@ -2806,6 +2907,8 @@ pub fn bind(
         }
         "ollama" => Ok(Box::new(OllamaProvider::default())),
         "mock" => Ok(Box::new(MockProvider)),
+        "mock-system-echo" => Ok(Box::new(MockSystemEchoProvider)),
+        "mock-downgrade" => Ok(Box::new(MockDowngradeProvider)),
         "mock-tool" => Ok(Box::new(MockToolProvider)),
         "mock-tool-fail" => Ok(Box::new(MockToolFailProvider)),
         other => Err(crate::Error::Provider(format!(
@@ -3223,6 +3326,32 @@ mod openai_tests {
         assert_eq!(content[0]["thinking"], "");
         assert_eq!(content[0]["signature"], "OPAQUE");
         assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn a_tool_call_written_as_prose_is_not_an_answer() {
+        // The exact string Scout published into a channel on 12 Sep, where
+        // the record said outcome=ok and response_chars=71.
+        let leaked = r#"tool call: web_fetch | {"url":"https://www.nativesonsroasters.com"}"#;
+        let tools = vec!["web_fetch".to_string(), "vault_write".to_string()];
+        assert_eq!(
+            attempted_tool_call(leaked, &tools).as_deref(),
+            Some("web_fetch")
+        );
+    }
+
+    #[test]
+    fn prose_that_merely_mentions_a_tool_is_still_an_answer() {
+        let tools = vec!["web_fetch".to_string()];
+        // Naming a tool while explaining yourself is normal and must not be
+        // withheld — the signature is a brace right behind the name.
+        assert!(
+            attempted_tool_call("I used web_fetch to check their site; it 404s.", &tools).is_none()
+        );
+        assert!(attempted_tool_call("No tools were needed for that.", &tools).is_none());
+        // A long essay that happens to contain a snippet is not a call.
+        let essay = "x".repeat(700) + r#" web_fetch {"url":"…"}"#;
+        assert!(attempted_tool_call(&essay, &tools).is_none());
     }
 
     #[test]

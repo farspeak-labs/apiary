@@ -1173,6 +1173,24 @@ function logRow(entry) {
   const failed = /error|fail|refus|broken|expired/i.test(outcome);
   what.append(document.createTextNode(' '), el('span', failed ? 'bad' : 'out', outcome));
 
+  // A run that served a model the ratified manifest did not name is a
+  // governance event, not a footnote — say so on the row rather than
+  // leaving it for whoever reads the raw detail.
+  if (b.detail?.model_divergence) {
+    const warn = el('span', 'bad', ` contract asked ${shortModel(b.detail.model_requested)}`);
+    warn.title = `The ratified manifest names ${b.detail.model_requested}; this run was served ${b.model}.`;
+    what.append(warn);
+  }
+
+  // Granted tools that did not bind. The run still succeeds, so this is
+  // the only place a partial grant is visible at all.
+  const dropped = b.detail?.tools_dropped || [];
+  if (dropped.length) {
+    const miss = el('span', 'bad', ` ${dropped.length} granted tool${dropped.length === 1 ? '' : 's'} did not bind`);
+    miss.title = dropped.join('\n');
+    what.append(miss);
+  }
+
   const facts = [
     shortModel(b.model),
     compactTokens(b.cost),

@@ -62,7 +62,7 @@ pub fn bind_connectors(
     custody: &Custody,
     agent: &AgentHandle,
 ) -> Result<Vec<Box<dyn Connector>>, crate::Error> {
-    bind_connectors_in(manifest, custody, agent, None)
+    bind_connectors_in(manifest, custody, agent, None, &mut Vec::new())
 }
 
 /// With the agent dir known, the agent also gets the PROPOSE tools —
@@ -72,6 +72,10 @@ pub fn bind_connectors_in(
     custody: &Custody,
     agent: &AgentHandle,
     agent_dir: Option<&std::path::Path>,
+    // `dropped` collects tools the manifest granted that did NOT bind, each
+    // with the reason. Empty is the normal case; anything in it is a grant
+    // that did not arrive as written, and the caller records it.
+    dropped: &mut Vec<String>,
 ) -> Result<Vec<Box<dyn Connector>>, crate::Error> {
     let mut out: Vec<Box<dyn Connector>> = Vec::new();
     let has_explicit_web_fetch = manifest
@@ -94,7 +98,7 @@ pub fn bind_connectors_in(
     }
     for entry in &manifest.connectors {
         match entry.kind.as_str() {
-            "mcp" => out.extend(bind_mcp(entry, custody, agent, agent_dir)?),
+            "mcp" => out.extend(bind_mcp(entry, custody, agent, agent_dir, dropped)?),
             "obsidian" => out.extend(bind_vault(
                 entry,
                 true,
@@ -339,6 +343,7 @@ fn bind_mcp(
     custody: &Custody,
     agent: &AgentHandle,
     agent_dir: Option<&std::path::Path>,
+    dropped: &mut Vec<String>,
 ) -> Result<Vec<Box<dyn Connector>>, crate::Error> {
     use std::sync::{Arc, Mutex};
     let cap_str = |k: &str| entry.caps.get(k).and_then(|v| v.as_str()).map(String::from);
@@ -479,10 +484,23 @@ fn bind_mcp(
         Err(e) => return Err(e),
     };
     let wildcard = allowed.iter().any(|a| a == "*");
+    // A grant that binds SOME of its tools used to do so silently, and the
+    // half that fails is the careful half: a tool marked read-only needs
+    // the server to declare readOnlyHint, while a read-write one binds
+    // unconditionally. So a 13-tool grant became 6 write tools and no
+    // reads, and nothing said a word. Partial is reportable, not normal.
+    let offered_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
     let granted: Vec<crate::mcp::McpTool> = tools
         .into_iter()
         .filter(|t| mcp_tool_allowed(t, &allowed, wildcard, read_only, &tool_access))
         .collect();
+    let kept: Vec<&str> = granted.iter().map(|t| t.name.as_str()).collect();
+    let wanted: Vec<String> = if !tool_access.is_empty() {
+        tool_access.keys().cloned().collect()
+    } else {
+        allowed.iter().filter(|a| *a != "*").cloned().collect()
+    };
+    dropped.extend(dropped_tool_reasons(&wanted, &kept, &offered_names));
     if granted.is_empty() {
         let message = if read_only {
             "mcp: no allowed tool is explicitly marked readOnlyHint=true; \
@@ -543,6 +561,30 @@ fn resolve_mcp_url(
         .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
         .map(String::from)
         .ok_or_else(|| crate::Error::Provider(format!("{} has no valid url", path.display())))
+}
+
+/// Why each granted tool did not bind. The two reasons need different
+/// fixes: a name the server has never heard of is a typo in the allowlist,
+/// while a tool the server offers but will not declare `readOnlyHint=true`
+/// is a read-only grant failing closed — the server has to annotate it, or
+/// the grant has to accept read-write.
+fn dropped_tool_reasons(wanted: &[String], kept: &[&str], offered: &[String]) -> Vec<String> {
+    const UNMARKED: &str =
+        ": granted read-only, but the server does not declare it readOnlyHint=true, so it fails closed";
+    const UNKNOWN: &str = ": the server offers no tool by that name";
+    let mut out = Vec::new();
+    for want in wanted {
+        if kept.contains(&want.as_str()) {
+            continue;
+        }
+        let reason = if offered.contains(want) {
+            UNMARKED
+        } else {
+            UNKNOWN
+        };
+        out.push(format!("{want}{reason}"));
+    }
+    out
 }
 
 fn mcp_tool_allowed(
@@ -2824,6 +2866,38 @@ mod connector_security_tests {
         assert!(mcp_tool_allowed(&write, &[], false, false, &granular));
         let unsafe_read = std::collections::HashMap::from([("write".to_string(), true)]);
         assert!(!mcp_tool_allowed(&write, &[], false, false, &unsafe_read));
+    }
+
+    #[test]
+    fn a_partial_grant_reports_what_did_not_bind_and_why() {
+        // Scout's 13-tool grant bound 6 — every write, no reads — and said
+        // nothing. The two reasons are different problems: one is a typo in
+        // the allowlist, the other a server that never annotates its reads.
+        let wanted = vec![
+            "platform_lead_create".to_string(),
+            "platform_lead_list".to_string(),
+            "no_such_tool".to_string(),
+        ];
+        let offered = vec![
+            "platform_lead_create".to_string(),
+            "platform_lead_list".to_string(),
+        ];
+        let reasons = dropped_tool_reasons(&wanted, &["platform_lead_create"], &offered);
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(reasons
+            .iter()
+            .any(|r| r.starts_with("platform_lead_list:") && r.contains("readOnlyHint")));
+        assert!(reasons
+            .iter()
+            .any(|r| r.starts_with("no_such_tool:") && r.contains("offers no tool")));
+        // No run of spaces smuggled in by a line continuation.
+        assert!(reasons.iter().all(|r| !r.contains("  ")), "{reasons:?}");
+    }
+
+    #[test]
+    fn a_grant_that_binds_whole_reports_nothing() {
+        let wanted = vec!["a".to_string()];
+        assert!(dropped_tool_reasons(&wanted, &["a"], &["a".to_string()]).is_empty());
     }
 
     /// "Did anything happen?" must fail closed: a connector that has not
