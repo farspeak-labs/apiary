@@ -164,53 +164,162 @@ pub fn is_ratified_events(
     agent: &PublicKey,
     suspend_keys: &[PublicKey],
 ) -> Result<bool, crate::Error> {
-    let want = manifest_hash(manifest_yaml);
+    Ok(
+        current_ratified_hash(events, agent, suspend_keys)?.as_deref()
+            == Some(manifest_hash(manifest_yaml).as_str()),
+    )
+}
+
+/// The hash of the manifest a governor most recently ratified for this
+/// agent — the only manifest that may run.
+///
+/// This used to ask whether a manifest had EVER been ratified, so a
+/// superseded contract stayed admissible forever: writing an older
+/// manifest's exact bytes back put it in force with no new signature, over
+/// a governor's later decision, and the cockpit badged it "Approved" with
+/// no approve button to click. A ratification is a decision, and a later
+/// decision replaces it — including one that took a grant away.
+///
+/// A ratification counts only as a complete pair: a suspend-key-signed
+/// `founding.ratify` naming this agent, for a hash the agent itself signed
+/// a `founding.manifest` for. Agent signatures are collected first and the
+/// LATEST qualifying ratification wins, so neither an orphaned agent
+/// signature nor a ratification by an unlisted key can move "current".
+pub fn current_ratified_hash(
+    events: &[Event],
+    agent: &PublicKey,
+    suspend_keys: &[PublicKey],
+) -> Result<Option<String>, crate::Error> {
     let agent_npub = crate::identity::to_npub(agent)?;
-    let hash_matches = |body: &EntryBody| {
+    let sha = |body: &EntryBody| {
         body.detail
             .as_ref()
             .and_then(|d| d.get("manifest_sha256"))
             .and_then(|v| v.as_str())
-            == Some(want.as_str())
+            .map(String::from)
     };
-    let mut agent_signed = false;
-    let mut human_ratified = false;
-    for event in events {
-        // Cryptographic checks first: signature and kind. Unverifiable
-        // entries are ignored, never trusted.
-        if event.kind != Kind::Custom(crate::log::LOG_ENTRY_KIND) || event.verify().is_err() {
+    // Cryptographic checks first: signature and kind. Unverifiable entries
+    // are ignored, never trusted.
+    let bodies: Vec<(&Event, EntryBody)> = events
+        .iter()
+        .filter(|event| {
+            event.kind == Kind::Custom(crate::log::LOG_ENTRY_KIND) && event.verify().is_ok()
+        })
+        .filter_map(|event| {
+            EpisodicLog::parse_body(event)
+                .ok()
+                .map(|body| (event, body))
+        })
+        .collect();
+    let agent_signed: std::collections::HashSet<String> = bodies
+        .iter()
+        .filter(|(event, body)| body.action == "founding.manifest" && event.pubkey == *agent)
+        .filter_map(|(_, body)| sha(body))
+        .collect();
+    let mut current = None;
+    for (event, body) in &bodies {
+        if body.action != "founding.ratify" || !suspend_keys.contains(&event.pubkey) {
             continue;
         }
-        let Ok(body) = EpisodicLog::parse_body(event) else {
+        let names_agent = body
+            .detail
+            .as_ref()
+            .and_then(|d| d.get("agent"))
+            .and_then(|v| v.as_str())
+            == Some(agent_npub.as_str());
+        if !names_agent {
             continue;
-        };
-        match body.action.as_str() {
-            "founding.manifest" => {
-                if event.pubkey == *agent && hash_matches(&body) {
-                    agent_signed = true;
-                }
-            }
-            "founding.ratify" => {
-                let names_agent = body
-                    .detail
-                    .as_ref()
-                    .and_then(|d| d.get("agent"))
-                    .and_then(|v| v.as_str())
-                    == Some(agent_npub.as_str());
-                if suspend_keys.contains(&event.pubkey) && names_agent && hash_matches(&body) {
-                    human_ratified = true;
-                }
-            }
-            _ => {}
+        }
+        if let Some(hash) = sha(body).filter(|hash| agent_signed.contains(hash)) {
+            current = Some(hash);
         }
     }
-    Ok(agent_signed && human_ratified)
+    Ok(current)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::custody::Custody;
+
+    fn ceremony_fixture(
+        name: &str,
+    ) -> (
+        std::path::PathBuf,
+        EpisodicLog,
+        Custody,
+        crate::custody::AgentHandle,
+        PublicKey,
+        String,
+        crate::custody::AgentHandle,
+        Vec<PublicKey>,
+    ) {
+        let dir = std::env::temp_dir().join(format!("apiary-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = EpisodicLog::open(&dir);
+        let mut custody = Custody::new();
+        let agent_keys = Keys::generate();
+        let agent_pk = agent_keys.public_key();
+        let agent = custody.admit(agent_keys);
+        let agent_npub = crate::identity::to_npub(&agent_pk).unwrap();
+        let governor_keys = Keys::generate();
+        let governors = vec![governor_keys.public_key()];
+        let governor = custody.admit(governor_keys);
+        (
+            dir, log, custody, agent, agent_pk, agent_npub, governor, governors,
+        )
+    }
+
+    /// Forge ran a relay its governor had moved it off, because its old
+    /// manifest's bytes were written back and "was this ever ratified?"
+    /// said yes. The later decision has to stand until a new one replaces it.
+    #[test]
+    fn a_superseded_ratification_is_not_admissible() {
+        let (dir, log, custody, agent, agent_pk, agent_npub, governor, governors) =
+            ceremony_fixture("supersede");
+        let broad = "manifest_version: 1\n# grant in force\n";
+        let narrow = "manifest_version: 1\n# the governor took the grant away\n";
+        for yaml in [broad, narrow] {
+            sign_manifest(&custody, &agent, &log, yaml).unwrap();
+            ratify(&custody, &governor, &log, &agent_npub, yaml).unwrap();
+        }
+        assert!(is_ratified(&log, narrow, &agent_pk, &governors).unwrap());
+        assert!(
+            !is_ratified(&log, broad, &agent_pk, &governors).unwrap(),
+            "restoring superseded bytes must need a NEW signature"
+        );
+
+        // Bringing the old one back is a legitimate decision too — as a new
+        // ratification, which then replaces the one before it.
+        sign_manifest(&custody, &agent, &log, broad).unwrap();
+        ratify(&custody, &governor, &log, &agent_npub, broad).unwrap();
+        assert!(is_ratified(&log, broad, &agent_pk, &governors).unwrap());
+        assert!(!is_ratified(&log, narrow, &agent_pk, &governors).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn neither_an_orphan_signature_nor_an_unlisted_ratifier_moves_current() {
+        let (dir, log, mut custody, agent, agent_pk, agent_npub, governor, governors) =
+            ceremony_fixture("current-held");
+        let approved = "manifest_version: 1\n# approved\n";
+        let attempted = "manifest_version: 1\n# not approved\n";
+        sign_manifest(&custody, &agent, &log, approved).unwrap();
+        ratify(&custody, &governor, &log, &agent_npub, approved).unwrap();
+
+        // The agent signs a newer manifest, but no governor follows.
+        sign_manifest(&custody, &agent, &log, attempted).unwrap();
+        assert!(is_ratified(&log, approved, &agent_pk, &governors).unwrap());
+        assert!(!is_ratified(&log, attempted, &agent_pk, &governors).unwrap());
+
+        // A key that is not a listed governor "ratifies" it anyway.
+        let stranger = custody.admit(Keys::generate());
+        ratify(&custody, &stranger, &log, &agent_npub, attempted).unwrap();
+        assert!(is_ratified(&log, approved, &agent_pk, &governors).unwrap());
+        assert!(!is_ratified(&log, attempted, &agent_pk, &governors).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn external_ratification_roundtrip() {

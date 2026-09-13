@@ -115,15 +115,14 @@ apiary manifest validate /tmp/<name>.yaml
 cp /tmp/<name>.yaml ~/.apiary/agents/<npub>/manifest.yaml
 ```
 
-Landing it unratified is correct — `manifest.yaml` is the proposal and
-`manifest.approved.yaml` is the contract. The agent will not run until a
-human signs. Confirm the two differ:
+Landing it unratified is correct — `manifest.yaml` is the proposal, and
+the agent will not run until a human signs **that exact file**.
 
-```bash
-D=~/.apiary/agents/<npub>
-[ "$(shasum -a 256 < $D/manifest.yaml)" = "$(shasum -a 256 < $D/manifest.approved.yaml)" ] \
-  && echo "ratified" || echo "awaiting the governor"
-```
+Do not judge that by comparing `manifest.yaml` with
+`manifest.approved.yaml`. The approved file is a snapshot kept for showing
+diffs; admission is decided by signed events in the agent's log, and the
+two can disagree. Ask the gate itself — the cockpit's ratified badge, or
+`ratified` from `GET /api/agents/<npub>/manifest`.
 
 ## 4. The human ratifies and activates
 
@@ -212,6 +211,15 @@ ticked. Read the tool NAMES before promising an agent can write anywhere.
 
 **Agent claims it lacks access it has** → same check. Trust the log, not the
 agent's self-report.
+
+**Never roll a manifest back by copying old bytes.** The gate used to ask
+whether a manifest had *ever* been ratified, so writing a superseded
+manifest back put it in force with no new signature — over the governor's
+later decision — and the cockpit badged it "Approved" with no approve button
+to click. It now admits only the latest ratification, so restored bytes stop
+the agent until they are signed again. On a host without that fix, restoring
+old bytes silently reverses a governance decision. To go back, stage the old
+content and have it ratified as a new decision.
 
 ## Agents with a coding harness
 
