@@ -643,6 +643,20 @@ fn unwrap_action(value: serde_json::Value) -> serde_json::Value {
             }
         }
     }
+    // The shape every tool-calling model is trained on, with only the
+    // contract's `kind` missing: `{"name": ..., "arguments": {...}}`, or
+    // `input` in Anthropic's spelling. Scout wrote exactly this after two
+    // fetches failed, and because it had no `kind` the loop published it
+    // as the answer — so the third source, the one that might have worked,
+    // never ran. It is plainly a request to call a tool; dispatch still
+    // refuses any name the agent was not granted.
+    let arguments = value
+        .get("arguments")
+        .or_else(|| value.get("input"))
+        .filter(|arguments| arguments.is_object());
+    if let (Some(name), Some(arguments)) = (value.get("name").and_then(|v| v.as_str()), arguments) {
+        return serde_json::json!({"kind": "tool", "name": name, "arguments": arguments});
+    }
     value
 }
 
@@ -650,6 +664,36 @@ fn unwrap_action(value: serde_json::Value) -> serde_json::Value {
 /// This uses the host's existing Claude Code sign-in. Project, plugin, MCP,
 /// filesystem, shell, and browser tools are all disabled, so Apiary remains
 /// the sole capability dispatcher.
+/// Which model to credit with a completion, from a runtime's per-model
+/// usage map, plus every model it billed.
+///
+/// Claude Code bills a small background model (`ANTHROPIC_SMALL_FAST_MODEL`,
+/// Haiku by default) beside the one it was asked for, and lists it first.
+/// Crediting the first key gave that side call the whole run, so a contract
+/// honoured run after run read as a model the manifest never named — a
+/// forty-run "downgrade" that the price of a single run disproves. The
+/// requested model counts as served whenever it was billed; only when it
+/// was not did the runtime choose something else, and then the first entry
+/// is the honest record of what.
+fn served_model_from_usage(
+    model_usage: &serde_json::Value,
+    requested: &str,
+) -> (String, Vec<String>) {
+    let billed: Vec<String> = model_usage
+        .as_object()
+        .map(|models| models.keys().cloned().collect())
+        .unwrap_or_default();
+    let served = if billed.iter().any(|billed| billed == requested) {
+        requested.to_string()
+    } else {
+        billed
+            .first()
+            .cloned()
+            .unwrap_or_else(|| requested.to_string())
+    };
+    (served, billed)
+}
+
 /// Lines from the CLI's stderr that bear on which model it chose.
 ///
 /// Deliberately a filter, not a dump: stderr is zeroized everywhere else
@@ -871,11 +915,7 @@ impl ClaudeCodeProvider {
             + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0)
             + usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
         let output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
-        let billed: Vec<String> = response["modelUsage"]
-            .as_object()
-            .map(|models| models.keys().cloned().collect())
-            .unwrap_or_default();
-        let served_model = billed.first().cloned().unwrap_or_else(|| model.to_string());
+        let (served_model, billed) = served_model_from_usage(&response["modelUsage"], model);
         // Only when the answer differs from the question. Every field here
         // is chosen to distinguish the candidate explanations: a second
         // billed model means a mid-run switch, an empty list means the CLI
@@ -1112,11 +1152,7 @@ impl ClaudeCodeProvider {
             + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0)
             + usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
         let output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
-        let served_model = response["modelUsage"]
-            .as_object()
-            .and_then(|models| models.keys().next())
-            .cloned()
-            .unwrap_or_else(|| model.to_string());
+        let (served_model, _) = served_model_from_usage(&response["modelUsage"], model);
         Ok(Completion {
             text: response["result"].as_str().unwrap_or_default().to_string(),
             model: served_model,
@@ -1819,11 +1855,7 @@ fn parse_grok_response(
         + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0)
         + usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
     let output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
-    let served_model = response["modelUsage"]
-        .as_object()
-        .and_then(|models| models.keys().next())
-        .cloned()
-        .unwrap_or_else(|| requested_model.to_string());
+    let (served_model, _) = served_model_from_usage(&response["modelUsage"], requested_model);
     Ok(Completion {
         text: response["text"].as_str().unwrap_or_default().to_string(),
         model: served_model,
@@ -3446,6 +3478,46 @@ compiling tools\n";
     #[test]
     fn a_clean_run_has_nothing_to_explain() {
         assert!(model_choice_notes("compiling\ndone\n").is_empty());
+    }
+
+    #[test]
+    fn a_function_call_missing_its_kind_is_a_tool_action() {
+        // Published into Scout's DM at 20:31 on 12 Sep, outcome ok.
+        let leaked = r#"<request for tool call> {"name":"web_fetch","arguments":{"url":"https://www.coffeeforums.co.uk/forums/home-roasting.11/"}}"#;
+        let action = parse_harness_action(leaked).expect("a tool call is in there");
+        assert_eq!(action["kind"], "tool");
+        assert_eq!(action["name"], "web_fetch");
+        assert_eq!(
+            action["arguments"]["url"],
+            "https://www.coffeeforums.co.uk/forums/home-roasting.11/"
+        );
+        // Anthropic's spelling of the same thing.
+        let input = r#"{"name":"vault_read","input":{"path":"a.md"}}"#;
+        let action = parse_harness_action(input).unwrap();
+        assert_eq!(action["kind"], "tool");
+        assert_eq!(action["arguments"]["path"], "a.md");
+        // A name with no argument object is still just data.
+        assert!(parse_harness_action(r#"Use {"name":"whatever"} here."#).is_none());
+    }
+
+    #[test]
+    fn the_requested_model_is_credited_when_it_was_billed() {
+        // What Claude Code reported for a sonnet-5 run: its background
+        // model listed first.
+        let usage = json!({"claude-haiku-4-5-20251001": {}, "claude-sonnet-5": {}});
+        let (served, billed) = served_model_from_usage(&usage, "claude-sonnet-5");
+        assert_eq!(served, "claude-sonnet-5");
+        assert_eq!(billed.len(), 2);
+    }
+
+    #[test]
+    fn a_model_chosen_instead_of_the_request_is_still_named() {
+        let usage = json!({"claude-haiku-4-5-20251001": {}});
+        let (served, _) = served_model_from_usage(&usage, "claude-sonnet-5");
+        assert_eq!(served, "claude-haiku-4-5-20251001");
+        let (served, billed) = served_model_from_usage(&json!(null), "claude-sonnet-5");
+        assert_eq!(served, "claude-sonnet-5");
+        assert!(billed.is_empty());
     }
 
     #[test]

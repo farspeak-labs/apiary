@@ -1176,7 +1176,13 @@ function logRow(entry) {
   // A run that served a model the ratified manifest did not name is a
   // governance event, not a footnote — say so on the row rather than
   // leaving it for whoever reads the raw detail.
-  if (b.detail?.model_divergence) {
+  // A runtime can bill a small background model beside the one it was
+  // asked for; that is not a divergence. Rows recorded before attribution
+  // learned this say `model_divergence: true` in the signed log forever,
+  // so the cockpit reads them correctly instead of crying wolf.
+  const billed = b.detail?.model_diagnostics?.billed_models || [];
+  const honoured = billed.includes(b.detail?.model_requested);
+  if (b.detail?.model_divergence && !honoured) {
     const warn = el('span', 'bad', ` contract asked ${shortModel(b.detail.model_requested)}`);
     const evidence = b.detail.model_diagnostics;
     const notes = (evidence?.cli_notes || []).join('\n');
