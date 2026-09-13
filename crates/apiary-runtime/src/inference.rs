@@ -3458,6 +3458,13 @@ compiling tools\n";
             attempted_tool_call(leaked, &tools).as_deref(),
             Some("web_fetch")
         );
+        // And the variant it produced at 19:24 the same day — the label
+        // changes between leaks, so the detector must not key on it.
+        let again = r#"tool_call: web_fetch | {"url":"https://old.reddit.com/r/roasting/"}"#;
+        assert_eq!(
+            attempted_tool_call(again, &tools).as_deref(),
+            Some("web_fetch")
+        );
     }
 
     #[test]
