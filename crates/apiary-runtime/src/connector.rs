@@ -96,9 +96,54 @@ pub fn bind_connectors_in(
             npub: manifest.identity.npub.clone(),
         }));
     }
-    for entry in &manifest.connectors {
+    // MCP servers bind in parallel and fail alone. Each one is a network
+    // round-trip to list its tools, and at scale some server is always down
+    // or holding an expired token. In series, an agent with twenty servers
+    // waited on all twenty before thinking, and one failure stopped it
+    // answering anything at all — the hazard 6d12991 recorded and could only
+    // work around. A server that cannot bind is recorded with its reason and
+    // the run goes ahead with the rest.
+    type McpBind = (Result<Vec<McpToolConnector>, crate::Error>, Vec<String>);
+    let mut mcp_bound: std::collections::HashMap<usize, McpBind> = std::thread::scope(|scope| {
+        let handles: Vec<_> = manifest
+            .connectors
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.kind == "mcp")
+            .map(|(index, entry)| {
+                scope.spawn(move || {
+                    let mut drops = Vec::new();
+                    let result = bind_mcp(entry, custody, agent, agent_dir, &mut drops);
+                    (index, result, drops)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .map(|(index, result, drops)| (index, (result, drops)))
+            .collect()
+    });
+    let mut mcp_tools: Vec<McpToolConnector> = Vec::new();
+    for (index, entry) in manifest.connectors.iter().enumerate() {
         match entry.kind.as_str() {
-            "mcp" => out.extend(bind_mcp(entry, custody, agent, agent_dir, dropped)?),
+            "mcp" => match mcp_bound.remove(&index) {
+                Some((Ok(tools), drops)) => {
+                    dropped.extend(drops);
+                    mcp_tools.extend(tools);
+                }
+                Some((Err(error), drops)) => {
+                    dropped.extend(drops);
+                    dropped.push(format!(
+                        "{}: server did not bind, so none of its tools are available: {error}",
+                        mcp_server_label(entry)
+                    ));
+                }
+                None => dropped.push(format!(
+                    "{}: server bind panicked, so none of its tools are available",
+                    mcp_server_label(entry)
+                )),
+            },
             "obsidian" => out.extend(bind_vault(
                 entry,
                 true,
@@ -165,6 +210,22 @@ pub fn bind_connectors_in(
             }
         }
     }
+    // Unique across every server, in manifest order, so a grant keeps the
+    // same tool names from one run to the next.
+    let taken: std::collections::HashSet<String> =
+        out.iter().map(|connector| connector.def().name).collect();
+    let wanted: Vec<String> = mcp_tools
+        .iter()
+        .map(|tool| tool.model_name.clone())
+        .collect();
+    for (mut tool, name) in mcp_tools
+        .into_iter()
+        .zip(unique_tool_names(&taken, &wanted))
+    {
+        tool.model_name = name;
+        out.push(Box::new(tool));
+    }
+
     // Presence-derived tools: a channel the agent LIVES on is also a place
     // it may speak first. Same sealed token, same allowlist — declaring
     // presence was the ratified act, so no separate grant exists to forget.
@@ -344,7 +405,7 @@ fn bind_mcp(
     agent: &AgentHandle,
     agent_dir: Option<&std::path::Path>,
     dropped: &mut Vec<String>,
-) -> Result<Vec<Box<dyn Connector>>, crate::Error> {
+) -> Result<Vec<McpToolConnector>, crate::Error> {
     use std::sync::{Arc, Mutex};
     let cap_str = |k: &str| entry.caps.get(k).and_then(|v| v.as_str()).map(String::from);
     let cap_list = |k: &str| -> Vec<String> {
@@ -512,23 +573,81 @@ fn bind_mcp(
         return Err(crate::Error::Provider(message.into()));
     }
     let shared = Arc::new(Mutex::new(client));
-    let mut out: Vec<Box<dyn Connector>> = Vec::new();
-    let mut used_names: Vec<String> = Vec::new();
-    for tool in granted {
-        let mut name = crate::mcp::model_tool_name(&tool.name);
-        while used_names.contains(&name) {
-            name.truncate(60);
-            name.push('x');
-        }
-        used_names.push(name.clone());
-        out.push(Box::new(McpToolConnector {
-            model_name: name,
+    // Named by server, and made unique across ALL servers by the caller.
+    // De-duplicating inside one server let two servers that both offer
+    // `search` hand the model two tools called `mcp_search`, and dispatch
+    // takes the first match — so the second was silently unreachable.
+    let label = mcp_server_label(entry);
+    Ok(granted
+        .into_iter()
+        .map(|tool| McpToolConnector {
+            model_name: crate::mcp::model_tool_name_for(&label, &tool.name),
             tool,
             client: shared.clone(),
             refresh: refresh.clone(),
-        }));
+        })
+        .collect())
+}
+
+/// Give every wanted name a slot no other tool holds, suffixing `_2`, `_3`
+/// in order. Server namespacing makes clashes rare; this makes them
+/// impossible, because dispatch takes the first tool whose name matches and
+/// a duplicate would be silently unreachable.
+fn unique_tool_names(taken: &std::collections::HashSet<String>, wanted: &[String]) -> Vec<String> {
+    let mut used = taken.clone();
+    wanted
+        .iter()
+        .map(|base| {
+            let mut name = base.clone();
+            let mut n = 2;
+            while used.contains(&name) {
+                let suffix = format!("_{n}");
+                name = base.clone();
+                name.truncate(64usize.saturating_sub(suffix.len()));
+                name.push_str(&suffix);
+                n += 1;
+            }
+            used.insert(name.clone());
+            name
+        })
+        .collect()
+}
+
+/// How a grant's server is named: its library name, else the host it
+/// points at, else the command it runs.
+fn mcp_server_label(entry: &apiary_core::manifest::Connector) -> String {
+    let cap = |k: &str| {
+        entry
+            .caps
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(name) = cap("library_name") {
+        return name.to_string();
     }
-    Ok(out)
+    if let Some(url) = cap("url") {
+        let host = url
+            .split("://")
+            .nth(1)
+            .unwrap_or(url)
+            .split('/')
+            .next()
+            .unwrap_or(url);
+        if !host.is_empty() {
+            return host.to_string();
+        }
+    }
+    if let Some(command) = cap("command") {
+        if let Some(base) = std::path::Path::new(command)
+            .file_name()
+            .and_then(|s| s.to_str())
+        {
+            return base.to_string();
+        }
+    }
+    "mcp".into()
 }
 
 fn resolve_mcp_url(
@@ -2925,5 +3044,34 @@ mod connector_security_tests {
         }
         assert!(!Undeclared.observes_only());
         assert!(!MockEcho.observes_only());
+    }
+}
+
+#[cfg(test)]
+mod mcp_naming_tests {
+    use super::unique_tool_names;
+    use std::collections::HashSet;
+
+    #[test]
+    fn clashing_tool_names_are_made_unique_in_order() {
+        let taken: HashSet<String> = ["web_fetch".to_string()].into();
+        let wanted = vec![
+            "mcp_a_search".to_string(),
+            "mcp_a_search".to_string(),
+            "web_fetch".to_string(),
+        ];
+        assert_eq!(
+            unique_tool_names(&taken, &wanted),
+            ["mcp_a_search", "mcp_a_search_2", "web_fetch_2"]
+        );
+    }
+
+    #[test]
+    fn a_suffixed_name_at_the_limit_stays_within_it() {
+        let base = "m".repeat(64);
+        let names = unique_tool_names(&HashSet::new(), &[base.clone(), base.clone()]);
+        assert_eq!(names[0], base);
+        assert_eq!(names[1].len(), 64);
+        assert!(names[1].ends_with("_2"));
     }
 }

@@ -599,9 +599,69 @@ pub fn model_tool_name(mcp_name: &str) -> String {
     name
 }
 
+/// A model-facing tool name that says which server the tool belongs to:
+/// `mcp_<server>_<tool>`, where `<server>` is the grant's library name.
+///
+/// Namespacing only when two servers collide sounds tidier and is worse:
+/// granting a new server would rename tools on servers already held, and
+/// any instruction that named them would quietly stop matching. A stable
+/// prefix costs one rename, once. The tool's own name is kept whole when the
+/// 64-character limit forces a cut, because that is the part the model
+/// recognizes; the server prefix gives way first.
+pub fn model_tool_name_for(server: &str, mcp_name: &str) -> String {
+    const LIMIT: usize = 64;
+    let clean = |s: &str, lower: bool| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    if lower {
+                        c.to_ascii_lowercase()
+                    } else {
+                        c
+                    }
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    let tool = clean(mcp_name, false);
+    let mut server = clean(server.trim(), true);
+    if server.is_empty() {
+        return model_tool_name(mcp_name);
+    }
+    let room = LIMIT.saturating_sub("mcp_".len() + 1 + tool.len());
+    server.truncate(room.max(1));
+    let mut name = format!("mcp_{server}_{tool}");
+    name.truncate(LIMIT);
+    name
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_names_carry_their_server() {
+        assert_eq!(
+            model_tool_name_for("ControlPanel-RW", "platform_lead_list"),
+            "mcp_controlpanel-rw_platform_lead_list"
+        );
+        // Two servers offering the same tool no longer produce one name.
+        assert_ne!(
+            model_tool_name_for("firecrawl-search", "search"),
+            model_tool_name_for("github", "search")
+        );
+    }
+
+    #[test]
+    fn a_long_tool_name_keeps_itself_and_the_server_gives_way() {
+        let tool = "an_unusually_descriptive_tool_name_for_reports";
+        let name = model_tool_name_for("a-server-with-a-very-long-library-name", tool);
+        assert!(name.len() <= 64, "{name}");
+        assert!(name.ends_with(tool), "{name}");
+        assert!(name.starts_with("mcp_a"), "{name}");
+    }
 
     #[test]
     fn tool_names_sanitize_for_the_model() {

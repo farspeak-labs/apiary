@@ -1472,6 +1472,55 @@ governance:
         assert!(granted_tools_section(&[]).contains("None — you can think and answer"));
     }
 
+    /// At scale some server is always down or holding an expired token. A
+    /// bind failure used to fail the whole run, so an agent holding twenty
+    /// servers answered nothing at all when one was unreachable.
+    #[test]
+    fn one_mcp_server_that_cannot_bind_does_not_stop_the_agent() {
+        let (mut manifest, dir, custody, handle) = setup();
+        manifest.connectors.push(apiary_core::manifest::Connector {
+            kind: "mcp".into(),
+            credential: None,
+            caps: [
+                (
+                    "library_name".to_string(),
+                    serde_json::json!("Broken-Server"),
+                ),
+                ("transport".to_string(), serde_json::json!("stdio")),
+                (
+                    "command".to_string(),
+                    serde_json::json!("/nonexistent/apiary-no-such-mcp-server"),
+                ),
+                ("allowed_tools".to_string(), serde_json::json!(["anything"])),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        manifest.validate().unwrap();
+
+        run_task(
+            &manifest,
+            &dir,
+            &custody,
+            &handle,
+            "hello",
+            &TaskContext::default(),
+        )
+        .expect("an unreachable MCP server must not stop the run");
+
+        let entries = EpisodicLog::open(&dir).read_all().unwrap();
+        let body = EpisodicLog::parse_body(entries.last().unwrap()).unwrap();
+        let dropped: Vec<String> =
+            serde_json::from_value(body.detail.unwrap()["tools_dropped"].clone()).unwrap();
+        assert!(
+            dropped
+                .iter()
+                .any(|d| d.starts_with("Broken-Server: server did not bind")),
+            "{dropped:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn exact_connection_test_disables_fallback() {
         let (mut manifest, dir, custody, handle) = setup();

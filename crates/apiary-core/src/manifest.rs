@@ -1067,6 +1067,22 @@ impl Manifest {
 
     /// Structural validation beyond serde: the invariants the substrate owns.
     pub fn validate(&self) -> Result<(), crate::Error> {
+        // One grant per MCP server name. The library name is how an agent
+        // holding many servers tells them apart — in the cockpit, in
+        // revocation, and in the `mcp_<server>_<tool>` names the model sees —
+        // so two grants sharing one would make every one of those ambiguous.
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            for connector in self.connectors.iter().filter(|c| c.kind == "mcp") {
+                if let Some(name) = connector.caps.get("library_name").and_then(|v| v.as_str()) {
+                    if !seen.insert(name) {
+                        return Err(crate::Error::Manifest(format!(
+                            "two mcp grants are both named '{name}' — each server needs its own library name"
+                        )));
+                    }
+                }
+            }
+        }
         if self.manifest_version != MANIFEST_VERSION {
             return Err(crate::Error::Manifest(format!(
                 "unsupported manifest_version {} (host supports {})",

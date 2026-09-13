@@ -3738,7 +3738,7 @@ pub async fn agent_connector_discover(
             Ok(v) => v,
             Err(e) => return e.into_response(),
         };
-    // Grants are keyed by kind; `name` here is the library entry name and
+    // Grants are keyed by library name; `name` here is the library entry name and
     // is matched against caps.library_name when present, else the sole
     // mcp grant (or the one whose url/command matches).
     let Some(entry) = manifest
@@ -3950,13 +3950,11 @@ pub async fn connector_set_allowed_tools(
         )
         .into_response();
     }
-    let Some(c) = manifest.connectors.iter_mut().find(|c| c.kind == kind) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            format!("agent has no '{kind}' connector"),
-        )
-        .into_response();
+    let index = match resolve_grant(&manifest, &kind) {
+        Ok(index) => index,
+        Err(e) => return e.into_response(),
     };
+    let c = &mut manifest.connectors[index];
     c.caps.insert("allowed_tools".into(), json!(tools));
     if let Some(policies) = tool_access {
         c.caps.insert("tool_access".into(), json!(policies));
@@ -4004,13 +4002,11 @@ pub async fn connector_patch_caps(
     let Some(patch) = body["caps"].as_object() else {
         return err(StatusCode::BAD_REQUEST, "caps object required").into_response();
     };
-    let Some(c) = manifest.connectors.iter_mut().find(|c| c.kind == kind) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            format!("agent has no '{kind}' connector"),
-        )
-        .into_response();
+    let index = match resolve_grant(&manifest, &kind) {
+        Ok(index) => index,
+        Err(e) => return e.into_response(),
     };
+    let c = &mut manifest.connectors[index];
     for (k, v) in patch {
         c.caps.insert(k.clone(), v.clone());
     }
@@ -4164,7 +4160,74 @@ pub async fn connector_grant(
     }
 }
 
-/// Upsert a library entry into a manifest (one entry per kind) and persist.
+/// The one grant a request addresses.
+///
+/// `key` is a grant's library name, which is how an agent holding many MCP
+/// servers tells them apart. Grants without one (a hand-written web-fetch,
+/// a vault) are addressed by kind, but only when exactly one grant has that
+/// kind. Addressing "the mcp connector" of an agent with several used to
+/// edit the first one and revoke all of them; now that is refused as
+/// ambiguous instead of guessed at.
+fn resolve_grant(manifest: &apiary_core::manifest::Manifest, key: &str) -> Result<usize, Resp> {
+    let named: Vec<usize> = manifest
+        .connectors
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.caps.get("library_name").and_then(|v| v.as_str()) == Some(key))
+        .map(|(index, _)| index)
+        .collect();
+    match named.as_slice() {
+        [index] => return Ok(*index),
+        [] => {}
+        many => {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!("{} grants are named '{key}'", many.len()),
+            ))
+        }
+    }
+    let of_kind: Vec<usize> = manifest
+        .connectors
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.kind == key)
+        .map(|(index, _)| index)
+        .collect();
+    match of_kind.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(err(
+            StatusCode::NOT_FOUND,
+            format!("agent has no grant named or of kind '{key}'"),
+        )),
+        many => Err(err(
+            StatusCode::CONFLICT,
+            format!(
+                "agent holds {} '{key}' connectors; address one by its library name",
+                many.len()
+            ),
+        )),
+    }
+}
+
+/// Remove whatever a new grant of `entry` replaces.
+///
+/// MCP grants are one per library entry, so an agent can hold as many
+/// servers as it needs; granting a second server used to evict the first.
+/// Every other kind stays one per kind, because those bind to fixed tool
+/// names (`web_fetch`, `vault_read`) that a second copy would duplicate.
+fn remove_superseded_grant(manifest: &mut apiary_core::manifest::Manifest, entry: &LibraryEntry) {
+    if entry.kind == "mcp" {
+        manifest.connectors.retain(|c| {
+            !(c.kind == "mcp"
+                && c.caps.get("library_name").and_then(|v| v.as_str()) == Some(entry.name.as_str()))
+        });
+    } else {
+        manifest.connectors.retain(|c| c.kind != entry.kind);
+    }
+}
+
+/// Upsert a library entry into a manifest and persist: one grant per MCP
+/// library entry, one per kind for everything else.
 fn write_grant(
     dir: &std::path::Path,
     expected_raw: &str,
@@ -4172,7 +4235,7 @@ fn write_grant(
     entry: &LibraryEntry,
     credential: Option<apiary_core::manifest::EncryptedBlob>,
 ) -> Result<String, Resp> {
-    manifest.connectors.retain(|c| c.kind != entry.kind);
+    remove_superseded_grant(manifest, entry);
     let mut caps = entry.caps.clone();
     // Library-only provenance helps the cockpit explain a curated template,
     // but is not an agent capability and should not travel in its manifest.
@@ -4199,15 +4262,13 @@ pub async fn connector_revoke(
             Ok(v) => v,
             Err(e) => return e.into_response(),
         };
-    let before = manifest.connectors.len();
-    manifest.connectors.retain(|c| c.kind != kind);
-    if manifest.connectors.len() == before {
-        return err(
-            StatusCode::NOT_FOUND,
-            format!("agent has no '{kind}' connector"),
-        )
-        .into_response();
-    }
+    // One grant, addressed by its library name. Revoking "the mcp
+    // connector" of an agent holding several used to remove every one.
+    let index = match resolve_grant(&manifest, &kind) {
+        Ok(index) => index,
+        Err(e) => return e.into_response(),
+    };
+    let revoked_kind = manifest.connectors.remove(index).kind;
     let yaml = match serde_yaml::to_string(&manifest) {
         Ok(y) => y,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -4219,6 +4280,7 @@ pub async fn connector_revoke(
         "ok": true,
         "npub": npub,
         "revoked": kind,
+        "kind": revoked_kind,
         "manifest_sha256": ceremony::manifest_hash(&yaml),
         "ratified": false,
         "note": "revocation is an amendment too — re-ratify. Until then the agent cannot run at all.",
@@ -6005,4 +6067,117 @@ pub async fn presence_revoke(
         "note": "presence removed — an amendment; re-ratify. The supervisor bounces the channel within a tick.",
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod connector_grant_tests {
+    use super::{remove_superseded_grant, resolve_grant, LibraryEntry};
+    use apiary_core::manifest::{Connector, Manifest};
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    fn manifest() -> Manifest {
+        let yaml = crate::template_manifest("npub1grants", &[], "grant tests");
+        Manifest::from_yaml_unvalidated(&yaml).expect("template parses")
+    }
+
+    fn mcp(name: &str) -> Connector {
+        Connector {
+            kind: "mcp".into(),
+            credential: None,
+            caps: [("library_name".to_string(), json!(name))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn entry(name: &str, kind: &str) -> LibraryEntry {
+        LibraryEntry {
+            name: name.into(),
+            kind: kind.into(),
+            caps: Default::default(),
+        }
+    }
+
+    fn mcp_names(m: &Manifest) -> Vec<String> {
+        m.connectors
+            .iter()
+            .filter(|c| c.kind == "mcp")
+            .filter_map(|c| c.caps.get("library_name")?.as_str().map(String::from))
+            .collect()
+    }
+
+    /// Scout held ControlPanel; granting Firecrawl would have replaced it.
+    #[test]
+    fn granting_a_second_mcp_server_keeps_the_first() {
+        let mut m = manifest();
+        m.connectors.push(mcp("ControlPanel-RW"));
+        remove_superseded_grant(&mut m, &entry("Firecrawl-Search", "mcp"));
+        m.connectors.push(mcp("Firecrawl-Search"));
+        assert_eq!(mcp_names(&m), ["ControlPanel-RW", "Firecrawl-Search"]);
+
+        // Re-granting a server replaces only that server.
+        remove_superseded_grant(&mut m, &entry("Firecrawl-Search", "mcp"));
+        m.connectors.push(mcp("Firecrawl-Search"));
+        assert_eq!(mcp_names(&m), ["ControlPanel-RW", "Firecrawl-Search"]);
+    }
+
+    #[test]
+    fn other_kinds_stay_one_per_kind() {
+        let mut m = manifest();
+        m.connectors.push(mcp("ControlPanel-RW"));
+        m.connectors.push(Connector {
+            kind: "web-fetch".into(),
+            credential: None,
+            caps: Default::default(),
+        });
+        remove_superseded_grant(&mut m, &entry("Public pages", "web-fetch"));
+        assert!(m.connectors.iter().all(|c| c.kind != "web-fetch"));
+        assert_eq!(mcp_names(&m), ["ControlPanel-RW"]);
+    }
+
+    #[test]
+    fn a_grant_is_addressed_by_name_and_by_kind_only_when_unambiguous() {
+        let mut m = manifest();
+        m.connectors.push(mcp("ControlPanel-RW"));
+        // One mcp grant: the old by-kind address still works.
+        assert_eq!(resolve_grant(&m, "mcp").map_err(|e| e.0), Ok(0));
+
+        m.connectors.push(mcp("Firecrawl-Search"));
+        m.connectors.push(Connector {
+            kind: "web-fetch".into(),
+            credential: None,
+            caps: Default::default(),
+        });
+        assert_eq!(
+            resolve_grant(&m, "Firecrawl-Search").map_err(|e| e.0),
+            Ok(1)
+        );
+        assert_eq!(resolve_grant(&m, "web-fetch").map_err(|e| e.0), Ok(2));
+        // Several mcp grants: refuse rather than pick the first.
+        assert_eq!(
+            resolve_grant(&m, "mcp").map_err(|e| e.0),
+            Err(StatusCode::CONFLICT)
+        );
+        assert_eq!(
+            resolve_grant(&m, "no-such-grant").map_err(|e| e.0),
+            Err(StatusCode::NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn two_mcp_grants_cannot_share_a_name() {
+        let mut m = manifest();
+        m.connectors.push(mcp("Same"));
+        m.connectors.push(mcp("Same"));
+        let error = m.validate().expect_err("duplicate names must not validate");
+        assert!(error.to_string().contains("both named 'Same'"), "{error}");
+
+        let mut distinct = manifest();
+        distinct.connectors.push(mcp("One"));
+        distinct.connectors.push(mcp("Two"));
+        if let Err(error) = distinct.validate() {
+            assert!(!error.to_string().contains("both named"), "{error}");
+        }
+    }
 }
