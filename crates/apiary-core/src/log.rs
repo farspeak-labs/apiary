@@ -384,6 +384,17 @@ impl EpisodicLog {
                 break;
             }
         }
+        // Reading backwards stops at an arbitrary byte offset, and an
+        // offset is not a character boundary — one em dash straddling it
+        // made the whole tail "not UTF-8" and took an agent's errand down
+        // with it. When we did not reach the start of the file the first
+        // line is a fragment that gets dropped anyway, so drop it while it
+        // is still bytes, before anything has to decode.
+        if cursor > 0 {
+            if let Some(newline) = bytes.iter().position(|&byte| byte == b'\n') {
+                bytes.drain(..=newline);
+            }
+        }
         let text = String::from_utf8(bytes)
             .map_err(|e| crate::Error::Manifest(format!("log is not UTF-8: {e}")))?;
         let mut lines = text
@@ -451,6 +462,59 @@ mod tests {
         let d = std::env::temp_dir().join(format!("apiary-log-{}-{}", name, std::process::id()));
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// A log full of em dashes — which every Apiary agent writes, because
+    /// the prose it is given is full of them — became unreadable the moment
+    /// it outgrew one 8 KiB backwards read and the read boundary landed
+    /// inside a character. The failure surfaced on the errand, not the log:
+    /// "manifest: log is not UTF-8: invalid utf-8 sequence of 1 bytes from
+    /// index 0", with the file itself perfectly valid.
+    #[test]
+    fn a_multibyte_character_across_the_read_boundary_is_not_a_corrupt_log() {
+        let dir = temp_dir("utf8-boundary");
+        let path = dir.join("log.jsonl");
+        let line = |i: usize, pad: usize| {
+            format!(
+                "{{\"n\":{i},\"note\":\"{}— an em dash — and more —\"}}\n",
+                "x".repeat(pad)
+            )
+        };
+        // Grow the file until the byte the tail read starts on is a UTF-8
+        // CONTINUATION byte: that is the defect, and a fixture that merely
+        // contains multibyte characters does not reproduce it.
+        let mut text = String::new();
+        let mut pad = 0;
+        loop {
+            text.clear();
+            for i in 0..400 {
+                text.push_str(&line(i, (i + pad) % 7));
+            }
+            let boundary = text.len() - 8 * 1024;
+            let byte = text.as_bytes()[boundary];
+            if (0x80..0xC0).contains(&byte) {
+                break;
+            }
+            pad += 1;
+            assert!(
+                pad < 64,
+                "could not position a character across the boundary"
+            );
+        }
+        fs::write(&path, &text).unwrap();
+
+        let log = EpisodicLog::open(&dir);
+        let lines = log.tail_lines(5).expect("tail must read a valid log");
+        assert_eq!(lines.len(), 5);
+        assert!(
+            lines.last().unwrap().contains("\"n\":399"),
+            "{:?}",
+            lines.last()
+        );
+        for line in &lines {
+            serde_json::from_str::<serde_json::Value>(line).expect("each tail line is whole JSON");
+        }
+        fs::remove_dir_all(&dir).ok();
     }
 
     fn body(action: &str) -> EntryBody {

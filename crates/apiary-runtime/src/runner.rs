@@ -375,7 +375,7 @@ pub fn run_task_observed(
     // "quiet" by observation, never by claiming it. Spans retries, because a
     // side effect in a failed attempt still happened.
     let acted = std::cell::Cell::new(false);
-    let (completion, slot_name, inference_harness, requested_model) = 'attempts: loop {
+    let (completion, slot_name, inference_harness, requested_model, model_diagnostics) = 'attempts: loop {
         let index = attempt_failures.len();
         let slot_name = candidates
             .get(index)
@@ -536,7 +536,15 @@ pub fn run_task_observed(
             )
         };
         match attempt {
-            Ok(completion) => break (completion, slot_name, harness, model),
+            Ok(completion) => {
+                break (
+                    completion,
+                    slot_name,
+                    harness,
+                    model,
+                    provider.diagnostics(),
+                )
+            }
             Err(error) => {
                 // Retrying after output or a tool call risks duplicate text or
                 // side effects. Only a clean provider-availability failure is
@@ -594,7 +602,8 @@ pub fn run_task_observed(
             }),
             harness: Some(inference_harness.clone()),
             outcome: completion.outcome.clone(),
-            detail: Some(json!({
+            detail: Some({
+                let mut detail = json!({
                 "task": task,
                 "primary_slot": primary_slot_name,
                 "slot": slot_name,
@@ -615,7 +624,14 @@ pub fn run_task_observed(
                 "response_chars": completion.text.len(),
                 "transcription": transcription_records,
                 "timings_ms": logged_timings,
-            })),
+                });
+                // Present only when the provider had something to explain,
+                // so an ordinary entry does not carry an empty field.
+                if let Some(evidence) = model_diagnostics {
+                    detail["model_diagnostics"] = evidence;
+                }
+                detail
+            }),
         },
     )?;
     let (_, overran) =

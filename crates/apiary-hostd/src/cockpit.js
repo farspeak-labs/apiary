@@ -1178,7 +1178,13 @@ function logRow(entry) {
   // leaving it for whoever reads the raw detail.
   if (b.detail?.model_divergence) {
     const warn = el('span', 'bad', ` contract asked ${shortModel(b.detail.model_requested)}`);
-    warn.title = `The ratified manifest names ${b.detail.model_requested}; this run was served ${b.model}.`;
+    const evidence = b.detail.model_diagnostics;
+    const notes = (evidence?.cli_notes || []).join('\n');
+    warn.title = [
+      `The ratified manifest names ${b.detail.model_requested}; this run was served ${b.model}.`,
+      evidence?.billed_models?.length ? `Billed: ${evidence.billed_models.join(', ')}` : null,
+      notes ? `The runtime said:\n${notes}` : 'The runtime gave no reason.',
+    ].filter(Boolean).join('\n\n');
     what.append(warn);
   }
 

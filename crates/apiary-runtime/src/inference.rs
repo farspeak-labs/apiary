@@ -79,6 +79,16 @@ pub trait Provider {
         "native"
     }
 
+    /// Anything the provider learned that explains an odd run — set only
+    /// when something needs explaining, so the ordinary record stays
+    /// small. Today this is the evidence for a model the contract did not
+    /// ask for: which models the runtime actually billed, and what it
+    /// wrote to stderr on its way to choosing one. Discarding that was why
+    /// "why is it serving haiku?" could only be answered by guessing.
+    fn diagnostics(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// `max_tokens` is the spend-authority clamp: the provider must not be
     /// asked for more output than the run's reserved budget allows.
     fn complete(
@@ -640,14 +650,62 @@ fn unwrap_action(value: serde_json::Value) -> serde_json::Value {
 /// This uses the host's existing Claude Code sign-in. Project, plugin, MCP,
 /// filesystem, shell, and browser tools are all disabled, so Apiary remains
 /// the sole capability dispatcher.
+/// Lines from the CLI's stderr that bear on which model it chose.
+///
+/// Deliberately a filter, not a dump: stderr is zeroized everywhere else
+/// in this file because it is not ours and may carry anything, and this
+/// text lands in a signed, replicated log. Matching lines are truncated
+/// and capped, so the record gains the CLI's explanation without becoming
+/// a place arbitrary output accumulates.
+fn model_choice_notes(stderr_text: &str) -> Vec<String> {
+    const CUES: [&str; 7] = [
+        "model",
+        "fallback",
+        "fall back",
+        "limit",
+        "quota",
+        "downgrade",
+        "not available",
+    ];
+    const MAX_NOTES: usize = 5;
+    const MAX_CHARS: usize = 200;
+    let mut out = Vec::new();
+    for line in stderr_text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lowered = line.to_lowercase();
+        if !CUES.iter().any(|cue| lowered.contains(cue)) {
+            continue;
+        }
+        let mut note: String = line.chars().take(MAX_CHARS).collect();
+        if line.chars().count() > MAX_CHARS {
+            note.push('…');
+        }
+        if !out.contains(&note) {
+            out.push(note);
+        }
+        if out.len() == MAX_NOTES {
+            break;
+        }
+    }
+    out
+}
+
 pub struct ClaudeCodeProvider {
     config_dir: IsolatedHarnessDir,
+    /// Evidence captured when the CLI served a model we did not ask for.
+    /// Interior mutability because `complete` takes `&self`; the provider
+    /// is built per attempt, so this never outlives one run.
+    diagnostics: std::sync::Mutex<Option<serde_json::Value>>,
 }
 
 impl ClaudeCodeProvider {
     pub fn new() -> Result<Self, crate::Error> {
         Ok(Self {
             config_dir: IsolatedHarnessDir::create("claude")?,
+            diagnostics: std::sync::Mutex::new(None),
         })
     }
 
@@ -797,6 +855,10 @@ impl ClaudeCodeProvider {
             }
         };
         stdout.bytes.zeroize();
+        // The CLI's own account of what it did. Kept as text only long
+        // enough to decide whether it explains anything; see
+        // `model_choice_notes` for why this is filtered rather than dumped.
+        let stderr_text = String::from_utf8_lossy(&stderr.bytes).into_owned();
         stderr.bytes.zeroize();
         if !status.success() || response["is_error"].as_bool() == Some(true) {
             let message = response["result"]
@@ -809,11 +871,32 @@ impl ClaudeCodeProvider {
             + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0)
             + usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
         let output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
-        let served_model = response["modelUsage"]
+        let billed: Vec<String> = response["modelUsage"]
             .as_object()
-            .and_then(|models| models.keys().next())
-            .cloned()
-            .unwrap_or_else(|| model.to_string());
+            .map(|models| models.keys().cloned().collect())
+            .unwrap_or_default();
+        let served_model = billed.first().cloned().unwrap_or_else(|| model.to_string());
+        // Only when the answer differs from the question. Every field here
+        // is chosen to distinguish the candidate explanations: a second
+        // billed model means a mid-run switch, an empty list means the CLI
+        // reported no usage at all, and the notes carry the CLI's own
+        // words about the model it picked.
+        if served_model != model {
+            let notes = model_choice_notes(&stderr_text);
+            let mut evidence = serde_json::Map::new();
+            evidence.insert("requested".into(), json!(model));
+            evidence.insert("billed_models".into(), json!(billed));
+            evidence.insert("cli_notes".into(), json!(notes));
+            if let Some(subtype) = response["subtype"].as_str() {
+                evidence.insert("subtype".into(), json!(subtype));
+            }
+            if let Some(cost) = response["total_cost_usd"].as_f64() {
+                evidence.insert("total_cost_usd".into(), json!(cost));
+            }
+            if let Ok(mut slot) = self.diagnostics.lock() {
+                *slot = Some(serde_json::Value::Object(evidence));
+            }
+        }
         Ok(Completion {
             text: response["result"].as_str().unwrap_or_default().to_string(),
             model: served_model,
@@ -1048,6 +1131,10 @@ impl ClaudeCodeProvider {
 }
 
 impl Provider for ClaudeCodeProvider {
+    fn diagnostics(&self) -> Option<serde_json::Value> {
+        self.diagnostics.lock().ok().and_then(|slot| slot.clone())
+    }
+
     fn harness(&self) -> &'static str {
         "claude-code"
     }
@@ -3326,6 +3413,39 @@ mod openai_tests {
         assert_eq!(content[0]["thinking"], "");
         assert_eq!(content[0]["signature"], "OPAQUE");
         assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn model_notes_keep_the_explanation_and_drop_the_rest() {
+        let stderr = "\
+starting up\n\
+Warning: model claude-sonnet-5 is not available on this plan, falling back\n\
+Authorization: Bearer sk-ant-secret-value-nobody-should-log\n\
+compiling tools\n";
+        let notes = model_choice_notes(stderr);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("not available"));
+        // The filter is the point: unrelated lines, and anything that
+        // happens to be sitting in an untrusted process's stderr, stay out
+        // of a signed log that replicates to relays.
+        assert!(!notes.iter().any(|n| n.contains("sk-ant")));
+        assert!(!notes.iter().any(|n| n.contains("compiling tools")));
+    }
+
+    #[test]
+    fn model_notes_are_bounded_in_count_and_length() {
+        let noisy = (0..50)
+            .map(|i| format!("model note {i} {}", "x".repeat(400)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let notes = model_choice_notes(&noisy);
+        assert!(notes.len() <= 5, "{}", notes.len());
+        assert!(notes.iter().all(|n| n.chars().count() <= 201), "{notes:?}");
+    }
+
+    #[test]
+    fn a_clean_run_has_nothing_to_explain() {
+        assert!(model_choice_notes("compiling\ndone\n").is_empty());
     }
 
     #[test]
