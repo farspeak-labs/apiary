@@ -258,7 +258,7 @@ pub fn run_task_observed(
     //    retrieval, all framed with provenance (memory is DATA, never
     //    instructions — SPEC §12.4, Phase 1 scope).
     let memory_started = std::time::Instant::now();
-    let system = if ctx.lightweight {
+    let mut system = if ctx.lightweight {
         "You are checking an approved Apiary inference connection. Reply with exactly OK.".into()
     } else {
         prep!(build_working_set(manifest, agent_dir, &log, task))
@@ -269,6 +269,7 @@ pub fn run_task_observed(
     //    capabilities exist) and infer. Every dispatch is logged BEFORE the
     //    result returns to the model — the track record sees each action.
     let connectors_started = std::time::Instant::now();
+    let mut dropped_tools: Vec<String> = Vec::new();
     let mut connectors = if ctx.disable_tools || ctx.lightweight {
         Vec::new()
     } else {
@@ -276,7 +277,8 @@ pub fn run_task_observed(
             manifest,
             custody,
             agent,
-            Some(agent_dir)
+            Some(agent_dir),
+            &mut dropped_tools
         ))
     };
     // The one capability that is not in the manifest: carrying THIS
@@ -300,6 +302,13 @@ pub fn run_task_observed(
         .iter()
         .map(|connector| connector.def().name)
         .collect();
+    // ...and what it was offered is also what it should SAY it holds. The
+    // record above answered the governor's question; the prompt still left
+    // the agent to answer from its constitution, which is how one spent a
+    // day denying access it had been granted.
+    if !ctx.lightweight {
+        system.push_str(&granted_tools_section(&offered_tools));
+    }
     let tool_calls = std::cell::Cell::new(0u32);
     // Input counts against the ceiling: refuse before dispatch when the
     // working set alone would consume the reservation.
@@ -366,7 +375,7 @@ pub fn run_task_observed(
     // "quiet" by observation, never by claiming it. Spans retries, because a
     // side effect in a failed attempt still happened.
     let acted = std::cell::Cell::new(false);
-    let (completion, slot_name, inference_harness) = 'attempts: loop {
+    let (completion, slot_name, inference_harness, requested_model, model_diagnostics) = 'attempts: loop {
         let index = attempt_failures.len();
         let slot_name = candidates
             .get(index)
@@ -527,7 +536,15 @@ pub fn run_task_observed(
             )
         };
         match attempt {
-            Ok(completion) => break (completion, slot_name, harness),
+            Ok(completion) => {
+                break (
+                    completion,
+                    slot_name,
+                    harness,
+                    model,
+                    provider.diagnostics(),
+                )
+            }
             Err(error) => {
                 // Retrying after output or a tool call risks duplicate text or
                 // side effects. Only a clean provider-availability failure is
@@ -585,18 +602,36 @@ pub fn run_task_observed(
             }),
             harness: Some(inference_harness.clone()),
             outcome: completion.outcome.clone(),
-            detail: Some(json!({
+            detail: Some({
+                let mut detail = json!({
                 "task": task,
                 "primary_slot": primary_slot_name,
                 "slot": slot_name,
+                // What the ratified manifest asked for, next to what the
+                // provider actually served. A contract that names a model
+                // and silently runs another is not a contract, and the
+                // divergence was invisible until both numbers sat here.
+                "model_requested": requested_model,
+                "model_divergence": completion.model != requested_model,
                 "fallback_attempts": attempt_failures,
                 "skills": selected_skill_names,
                 "tools_offered": offered_tools,
+                // Granted but did not bind. A partial grant is the shape
+                // least-privilege configuration fails into, so it belongs
+                // in the record next to what did bind.
+                "tools_dropped": dropped_tools,
                 "tool_calls": tool_calls.get(),
                 "response_chars": completion.text.len(),
                 "transcription": transcription_records,
                 "timings_ms": logged_timings,
-            })),
+                });
+                // Present only when the provider had something to explain,
+                // so an ordinary entry does not carry an empty field.
+                if let Some(evidence) = model_diagnostics {
+                    detail["model_diagnostics"] = evidence;
+                }
+                detail
+            }),
         },
     )?;
     let (_, overran) =
@@ -747,6 +782,33 @@ fn task_requests_deep_recall(task: &str) -> bool {
     ]
     .iter()
     .any(|cue| task.contains(cue))
+}
+
+/// Name the tools this run actually holds.
+///
+/// The working set already listed connector KINDS — and "mcp" tells an
+/// agent nothing about whether it can create a lead. So an agent asked
+/// what it could do answered from its constitution, was confidently
+/// wrong, and its wrong answer came back as channel history that made the
+/// next wrong answer likelier. The list below is built from what BOUND,
+/// not from what the manifest hoped would bind, so a capability that
+/// failed to bind cannot be claimed either.
+fn granted_tools_section(tools: &[String]) -> String {
+    if tools.is_empty() {
+        return "\n\n# Tools you hold this run [provenance: host-enforced bind]\n\
+                None — you can think and answer, nothing else. Say exactly that \
+                if you are asked what you can do."
+            .to_string();
+    }
+    format!(
+        "\n\n# Tools you hold this run [provenance: host-enforced bind]\n\
+         {list}\n\
+         This is the authority on what you can do: the host built it from your \
+         ratified grants when this run started. It overrides your constitution \
+         and anything you said earlier about your own access. Prefer calling a \
+         tool over describing what someone else would have to do.",
+        list = tools.join(", ")
+    )
 }
 
 pub(crate) fn build_working_set(
@@ -1187,7 +1249,7 @@ governance:
   suspend_keys:
     - {human}
   budgets:
-    tokens_per_day: 600
+    tokens_per_day: 900
 "#
         ))
         .unwrap();
@@ -1278,6 +1340,188 @@ governance:
     }
 
     #[test]
+    fn a_served_model_the_contract_did_not_name_is_recorded_as_divergence() {
+        // The manifest is a contract. When the provider serves something
+        // else, the run used to record only what was served — so a fleet
+        // could run for weeks on a model nobody ratified and every entry
+        // read `ok`. Both values now sit in the record.
+        let (mut manifest, dir, custody, handle) = setup();
+        manifest.inference[0].provider = "mock-downgrade".into();
+        manifest.inference[0].model = Some("ratified-model".into());
+        manifest.validate().unwrap();
+
+        let out = run_task(
+            &manifest,
+            &dir,
+            &custody,
+            &handle,
+            "hello",
+            &TaskContext::default(),
+        )
+        .unwrap();
+        assert_eq!(out.completion.model, crate::inference::MOCK_DOWNGRADE_MODEL);
+
+        let entries = EpisodicLog::open(&dir).read_all().unwrap();
+        let body = EpisodicLog::parse_body(entries.last().unwrap()).unwrap();
+        let detail = body.detail.unwrap();
+        assert_eq!(detail["model_requested"], "ratified-model");
+        assert_eq!(detail["model_divergence"], true);
+        // And the served model stays the attribution, so the record still
+        // says what actually ran.
+        assert_eq!(body.model.unwrap(), crate::inference::MOCK_DOWNGRADE_MODEL);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_honoured_model_is_not_flagged() {
+        let (manifest, dir, custody, handle) = setup();
+        let out = run_task(
+            &manifest,
+            &dir,
+            &custody,
+            &handle,
+            "hello",
+            &TaskContext::default(),
+        )
+        .unwrap();
+        let entries = EpisodicLog::open(&dir).read_all().unwrap();
+        let body = EpisodicLog::parse_body(entries.last().unwrap()).unwrap();
+        let detail = body.detail.unwrap();
+        assert_eq!(detail["model_divergence"], false);
+        assert_eq!(detail["model_requested"], out.completion.model);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_prompt_names_the_tools_that_actually_bound() {
+        // Scout held mcp_platform_lead_create and told a person, five times,
+        // that it had read-only access. Its prompt listed the connector kind
+        // "mcp" and nothing else, so its constitution was the only thing it
+        // could answer from.
+        let (mut manifest, dir, custody, handle) = setup();
+        manifest.inference[0].provider = "mock-system-echo".into();
+        manifest.connectors.push(apiary_core::manifest::Connector {
+            kind: "mock-echo".into(),
+            credential: None,
+            caps: Default::default(),
+        });
+        manifest.validate().unwrap();
+
+        let out = run_task(
+            &manifest,
+            &dir,
+            &custody,
+            &handle,
+            "what can you do?",
+            &TaskContext::default(),
+        )
+        .unwrap();
+
+        // The mock provider echoes its prompt, so the run's own text is the
+        // proof the section reached the model.
+        assert!(
+            out.completion.text.contains("Tools you hold this run"),
+            "no tool inventory in the prompt: {}",
+            out.completion.text
+        );
+        let entries = EpisodicLog::open(&dir).read_all().unwrap();
+        let body = EpisodicLog::parse_body(entries.last().unwrap()).unwrap();
+        let offered = body.detail.unwrap()["tools_offered"].clone();
+        let offered: Vec<String> = serde_json::from_value(offered).unwrap();
+        assert!(!offered.is_empty(), "the test connector bound nothing");
+        for tool in &offered {
+            assert!(
+                out.completion.text.contains(tool.as_str()),
+                "bound tool {tool} missing from the prompt"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_agent_with_no_granted_connectors_still_learns_it_can_propose() {
+        // There is no such thing as a toolless run: the governance tools
+        // are always bound. An agent that does not know it can propose an
+        // amendment tells people to go and edit its manifest by hand.
+        let (mut manifest, dir, custody, handle) = setup();
+        manifest.inference[0].provider = "mock-system-echo".into();
+        manifest.connectors.clear();
+        manifest.validate().unwrap();
+        let out = run_task(
+            &manifest,
+            &dir,
+            &custody,
+            &handle,
+            "what can you do?",
+            &TaskContext::default(),
+        )
+        .unwrap();
+        let section = out
+            .completion
+            .text
+            .rsplit("# Tools you hold this run")
+            .next()
+            .unwrap();
+        assert!(section.contains("propose_amendment"), "{section}");
+        assert!(section.contains("overrides your constitution"), "{section}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_run_with_tools_disabled_says_so_rather_than_listing_nothing() {
+        assert!(granted_tools_section(&[]).contains("None — you can think and answer"));
+    }
+
+    /// At scale some server is always down or holding an expired token. A
+    /// bind failure used to fail the whole run, so an agent holding twenty
+    /// servers answered nothing at all when one was unreachable.
+    #[test]
+    fn one_mcp_server_that_cannot_bind_does_not_stop_the_agent() {
+        let (mut manifest, dir, custody, handle) = setup();
+        manifest.connectors.push(apiary_core::manifest::Connector {
+            kind: "mcp".into(),
+            credential: None,
+            caps: [
+                (
+                    "library_name".to_string(),
+                    serde_json::json!("Broken-Server"),
+                ),
+                ("transport".to_string(), serde_json::json!("stdio")),
+                (
+                    "command".to_string(),
+                    serde_json::json!("/nonexistent/apiary-no-such-mcp-server"),
+                ),
+                ("allowed_tools".to_string(), serde_json::json!(["anything"])),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        manifest.validate().unwrap();
+
+        run_task(
+            &manifest,
+            &dir,
+            &custody,
+            &handle,
+            "hello",
+            &TaskContext::default(),
+        )
+        .expect("an unreachable MCP server must not stop the run");
+
+        let entries = EpisodicLog::open(&dir).read_all().unwrap();
+        let body = EpisodicLog::parse_body(entries.last().unwrap()).unwrap();
+        let dropped: Vec<String> =
+            serde_json::from_value(body.detail.unwrap()["tools_dropped"].clone()).unwrap();
+        assert!(
+            dropped
+                .iter()
+                .any(|d| d.starts_with("Broken-Server: server did not bind")),
+            "{dropped:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn exact_connection_test_disables_fallback() {
         let (mut manifest, dir, custody, handle) = setup();
         manifest.inference[0].provider = "no-such-provider".into();
@@ -1355,7 +1599,7 @@ governance:
         let log = EpisodicLog::open(&dir);
         assert_eq!(log.verify().unwrap(), 1);
 
-        // Burn the 600-token/day budget down: the mock spends ~16 per run,
+        // Burn the 900-token/day budget down: the mock spends ~16 per run,
         // and the INPUT-estimate guard (security round 2) refuses once the
         // remainder can no longer cover the working set itself (~370
         // estimated tokens) — the ceiling now counts input, not just output.

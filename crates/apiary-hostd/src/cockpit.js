@@ -1173,6 +1173,36 @@ function logRow(entry) {
   const failed = /error|fail|refus|broken|expired/i.test(outcome);
   what.append(document.createTextNode(' '), el('span', failed ? 'bad' : 'out', outcome));
 
+  // A run that served a model the ratified manifest did not name is a
+  // governance event, not a footnote — say so on the row rather than
+  // leaving it for whoever reads the raw detail.
+  // A runtime can bill a small background model beside the one it was
+  // asked for; that is not a divergence. Rows recorded before attribution
+  // learned this say `model_divergence: true` in the signed log forever,
+  // so the cockpit reads them correctly instead of crying wolf.
+  const billed = b.detail?.model_diagnostics?.billed_models || [];
+  const honoured = billed.includes(b.detail?.model_requested);
+  if (b.detail?.model_divergence && !honoured) {
+    const warn = el('span', 'bad', ` contract asked ${shortModel(b.detail.model_requested)}`);
+    const evidence = b.detail.model_diagnostics;
+    const notes = (evidence?.cli_notes || []).join('\n');
+    warn.title = [
+      `The ratified manifest names ${b.detail.model_requested}; this run was served ${b.model}.`,
+      evidence?.billed_models?.length ? `Billed: ${evidence.billed_models.join(', ')}` : null,
+      notes ? `The runtime said:\n${notes}` : 'The runtime gave no reason.',
+    ].filter(Boolean).join('\n\n');
+    what.append(warn);
+  }
+
+  // Granted tools that did not bind. The run still succeeds, so this is
+  // the only place a partial grant is visible at all.
+  const dropped = b.detail?.tools_dropped || [];
+  if (dropped.length) {
+    const miss = el('span', 'bad', ` ${dropped.length} granted tool${dropped.length === 1 ? '' : 's'} did not bind`);
+    miss.title = dropped.join('\n');
+    what.append(miss);
+  }
+
   const facts = [
     shortModel(b.model),
     compactTokens(b.cost),
@@ -3476,6 +3506,9 @@ async function renderConnectors(c) {
     const box = el('div', 'ev');
     const row = el('div', 'row');
     const title = (g.caps && g.caps.library_name) || (g.caps && g.caps.vaults && g.caps.vaults[0] && g.caps.vaults[0].name) || g.type;
+    // Address THIS grant. By kind, "the mcp connector" of an agent holding
+    // several meant the first one for edits and every one for revocation.
+    const key = (g.caps && g.caps.library_name) || g.type;
     row.append(el('b', null, title), el('span', 'meta', connectorKindLabel[g.type] || g.type), el('span', 'meta', g.credential ? 'credential sealed to this agent' : 'no credential'));
     row.append(el('span', 'grow', ''));
     const rv = el('button', 'btn danger', 'REVOKE');
@@ -3485,7 +3518,7 @@ async function renderConnectors(c) {
       const previous = connectorAccessMode(g.type, g.caps || {});
       const caps = {}; setConnectorAccess(g.type, caps, mode);
       select.disabled = true;
-      const r = await j(api('/connectors/' + encodeURIComponent(g.type) + '/caps'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ caps }) });
+      const r = await j(api('/connectors/' + encodeURIComponent(key) + '/caps'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ caps }) });
       select.disabled = false;
       if (!r.ok) select.value = previous;
       else {
@@ -3498,8 +3531,8 @@ async function renderConnectors(c) {
       if (r.ok) loadRoster();
     });
     rv.onclick = async () => {
-      const r = await j(api('/connectors/' + encodeURIComponent(g.type)), { method: 'DELETE' });
-      gStatus.textContent = r.ok ? `revoked ${g.type} — re-ratify in Configuration` : 'failed: ' + r.error;
+      const r = await j(api('/connectors/' + encodeURIComponent(key)), { method: 'DELETE' });
+      gStatus.textContent = r.ok ? `revoked ${key} — re-ratify in Configuration` : 'failed: ' + r.error;
       loadRoster(); render();
     };
     if (g.type === 'mcp') {
@@ -3537,7 +3570,7 @@ async function renderConnectors(c) {
         toolsBox.append(aRow);
         apply.onclick = async () => {
           const toolAccess = mcpToolPolicyObject(policies);
-          const rr = await j(api('/connectors/mcp/allowed_tools'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tools: Object.keys(toolAccess), tool_access: toolAccess }) });
+          const rr = await j(api('/connectors/' + encodeURIComponent(key) + '/allowed_tools'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tools: Object.keys(toolAccess), tool_access: toolAccess }) });
           aSt.textContent = rr.ok ? 'Applied. Opening review and approval…' : 'failed: ' + rr.error;
           if (rr.ok) {
             g.caps = Object.assign({}, g.caps || {}, { allowed_tools: rr.allowed_tools, tool_access: rr.tool_access || toolAccess, access: rr.access || 'mixed' });

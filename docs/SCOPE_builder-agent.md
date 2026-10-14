@@ -55,6 +55,8 @@ Not: "look for things to improve." An agent given an unbounded mandate to improv
 - **No network from the harness.** It reads the repository it was given. Docs research is a separate, ordinary `web-fetch` grant on the _agent_, not a hole in the coding sandbox.
   
 - **No write access to its own manifest.** It proposes, like everything else. `propose_amendment` already lands in the governor's queue.
+
+  **Correction, 2026-09-12.** With `sandbox: none` the harness runs as the same Unix user as the host, so it *can* write any agent's `manifest.yaml`, its own included. That was worse than it sounds: the ratification gate admitted any manifest that had *ever* been ratified, so writing an older, broader manifest back reinstated it with no signature. The gate now admits only the latest ratification, which turns that path from escalation into denial of service — a written proposal stops the agent until a governor signs. "It proposes" is enforced by the gate, not by file permissions; the bullet is not true as written until the harness has a filesystem boundary.
   
 
 That last one has an edge worth naming: it _can_ propose a patch that edits `manifest.rs` — the code that validates manifests. That is a real path around the proposal gate, and it is not closable by permissions. It closes at review, which is one more reason the volume cap matters more here than anywhere else.

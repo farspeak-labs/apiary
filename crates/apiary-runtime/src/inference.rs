@@ -79,6 +79,16 @@ pub trait Provider {
         "native"
     }
 
+    /// Anything the provider learned that explains an odd run — set only
+    /// when something needs explaining, so the ordinary record stays
+    /// small. Today this is the evidence for a model the contract did not
+    /// ask for: which models the runtime actually billed, and what it
+    /// wrote to stderr on its way to choosing one. Discarding that was why
+    /// "why is it serving haiku?" could only be answered by guessing.
+    fn diagnostics(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// `max_tokens` is the spend-authority clamp: the provider must not be
     /// asked for more output than the run's reserved budget allows.
     fn complete(
@@ -565,6 +575,33 @@ fn embedded_action(text: &str) -> Option<serde_json::Value> {
 /// So before falling back, look for the answer inside. Only a `text`-ish
 /// string one or two levels down counts — this rescues a mis-shaped
 /// envelope without inventing meaning for arbitrary JSON.
+/// A tool call the model wrote as prose instead of as the contract's JSON.
+///
+/// `tool call: web_fetch | {"url":"…"}` is not JSON, so the action parser
+/// returns None and the loop used to treat it as "prose, which is a fine
+/// answer" — publishing it to a chat channel and recording the run `ok`.
+/// The signature is a granted tool NAME with a brace or paren right behind
+/// it; ordinary prose mentioning a tool ("I used web_fetch to check") has
+/// no such adjacency, so it still reads as the answer it is.
+fn attempted_tool_call(text: &str, tool_names: &[String]) -> Option<String> {
+    let text = text.trim();
+    if text.len() > 600 {
+        return None;
+    }
+    for name in tool_names {
+        let mut from = 0;
+        while let Some(at) = text[from..].find(name.as_str()) {
+            let start = from + at + name.len();
+            let window: String = text[start..].chars().take(12).collect();
+            if window.contains('{') || window.contains('(') {
+                return Some(name.clone());
+            }
+            from = start;
+        }
+    }
+    None
+}
+
 fn salvage_text(raw: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
     fn pick(value: &serde_json::Value, depth: usize) -> Option<String> {
@@ -606,6 +643,20 @@ fn unwrap_action(value: serde_json::Value) -> serde_json::Value {
             }
         }
     }
+    // The shape every tool-calling model is trained on, with only the
+    // contract's `kind` missing: `{"name": ..., "arguments": {...}}`, or
+    // `input` in Anthropic's spelling. Scout wrote exactly this after two
+    // fetches failed, and because it had no `kind` the loop published it
+    // as the answer — so the third source, the one that might have worked,
+    // never ran. It is plainly a request to call a tool; dispatch still
+    // refuses any name the agent was not granted.
+    let arguments = value
+        .get("arguments")
+        .or_else(|| value.get("input"))
+        .filter(|arguments| arguments.is_object());
+    if let (Some(name), Some(arguments)) = (value.get("name").and_then(|v| v.as_str()), arguments) {
+        return serde_json::json!({"kind": "tool", "name": name, "arguments": arguments});
+    }
     value
 }
 
@@ -613,14 +664,92 @@ fn unwrap_action(value: serde_json::Value) -> serde_json::Value {
 /// This uses the host's existing Claude Code sign-in. Project, plugin, MCP,
 /// filesystem, shell, and browser tools are all disabled, so Apiary remains
 /// the sole capability dispatcher.
+/// Which model to credit with a completion, from a runtime's per-model
+/// usage map, plus every model it billed.
+///
+/// Claude Code bills a small background model (`ANTHROPIC_SMALL_FAST_MODEL`,
+/// Haiku by default) beside the one it was asked for, and lists it first.
+/// Crediting the first key gave that side call the whole run, so a contract
+/// honoured run after run read as a model the manifest never named — a
+/// forty-run "downgrade" that the price of a single run disproves. The
+/// requested model counts as served whenever it was billed; only when it
+/// was not did the runtime choose something else, and then the first entry
+/// is the honest record of what.
+fn served_model_from_usage(
+    model_usage: &serde_json::Value,
+    requested: &str,
+) -> (String, Vec<String>) {
+    let billed: Vec<String> = model_usage
+        .as_object()
+        .map(|models| models.keys().cloned().collect())
+        .unwrap_or_default();
+    let served = if billed.iter().any(|billed| billed == requested) {
+        requested.to_string()
+    } else {
+        billed
+            .first()
+            .cloned()
+            .unwrap_or_else(|| requested.to_string())
+    };
+    (served, billed)
+}
+
+/// Lines from the CLI's stderr that bear on which model it chose.
+///
+/// Deliberately a filter, not a dump: stderr is zeroized everywhere else
+/// in this file because it is not ours and may carry anything, and this
+/// text lands in a signed, replicated log. Matching lines are truncated
+/// and capped, so the record gains the CLI's explanation without becoming
+/// a place arbitrary output accumulates.
+fn model_choice_notes(stderr_text: &str) -> Vec<String> {
+    const CUES: [&str; 7] = [
+        "model",
+        "fallback",
+        "fall back",
+        "limit",
+        "quota",
+        "downgrade",
+        "not available",
+    ];
+    const MAX_NOTES: usize = 5;
+    const MAX_CHARS: usize = 200;
+    let mut out = Vec::new();
+    for line in stderr_text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lowered = line.to_lowercase();
+        if !CUES.iter().any(|cue| lowered.contains(cue)) {
+            continue;
+        }
+        let mut note: String = line.chars().take(MAX_CHARS).collect();
+        if line.chars().count() > MAX_CHARS {
+            note.push('…');
+        }
+        if !out.contains(&note) {
+            out.push(note);
+        }
+        if out.len() == MAX_NOTES {
+            break;
+        }
+    }
+    out
+}
+
 pub struct ClaudeCodeProvider {
     config_dir: IsolatedHarnessDir,
+    /// Evidence captured when the CLI served a model we did not ask for.
+    /// Interior mutability because `complete` takes `&self`; the provider
+    /// is built per attempt, so this never outlives one run.
+    diagnostics: std::sync::Mutex<Option<serde_json::Value>>,
 }
 
 impl ClaudeCodeProvider {
     pub fn new() -> Result<Self, crate::Error> {
         Ok(Self {
             config_dir: IsolatedHarnessDir::create("claude")?,
+            diagnostics: std::sync::Mutex::new(None),
         })
     }
 
@@ -770,6 +899,10 @@ impl ClaudeCodeProvider {
             }
         };
         stdout.bytes.zeroize();
+        // The CLI's own account of what it did. Kept as text only long
+        // enough to decide whether it explains anything; see
+        // `model_choice_notes` for why this is filtered rather than dumped.
+        let stderr_text = String::from_utf8_lossy(&stderr.bytes).into_owned();
         stderr.bytes.zeroize();
         if !status.success() || response["is_error"].as_bool() == Some(true) {
             let message = response["result"]
@@ -782,11 +915,28 @@ impl ClaudeCodeProvider {
             + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0)
             + usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
         let output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
-        let served_model = response["modelUsage"]
-            .as_object()
-            .and_then(|models| models.keys().next())
-            .cloned()
-            .unwrap_or_else(|| model.to_string());
+        let (served_model, billed) = served_model_from_usage(&response["modelUsage"], model);
+        // Only when the answer differs from the question. Every field here
+        // is chosen to distinguish the candidate explanations: a second
+        // billed model means a mid-run switch, an empty list means the CLI
+        // reported no usage at all, and the notes carry the CLI's own
+        // words about the model it picked.
+        if served_model != model {
+            let notes = model_choice_notes(&stderr_text);
+            let mut evidence = serde_json::Map::new();
+            evidence.insert("requested".into(), json!(model));
+            evidence.insert("billed_models".into(), json!(billed));
+            evidence.insert("cli_notes".into(), json!(notes));
+            if let Some(subtype) = response["subtype"].as_str() {
+                evidence.insert("subtype".into(), json!(subtype));
+            }
+            if let Some(cost) = response["total_cost_usd"].as_f64() {
+                evidence.insert("total_cost_usd".into(), json!(cost));
+            }
+            if let Ok(mut slot) = self.diagnostics.lock() {
+                *slot = Some(serde_json::Value::Object(evidence));
+            }
+        }
         Ok(Completion {
             text: response["result"].as_str().unwrap_or_default().to_string(),
             model: served_model,
@@ -1002,11 +1152,7 @@ impl ClaudeCodeProvider {
             + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0)
             + usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
         let output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
-        let served_model = response["modelUsage"]
-            .as_object()
-            .and_then(|models| models.keys().next())
-            .cloned()
-            .unwrap_or_else(|| model.to_string());
+        let (served_model, _) = served_model_from_usage(&response["modelUsage"], model);
         Ok(Completion {
             text: response["result"].as_str().unwrap_or_default().to_string(),
             model: served_model,
@@ -1021,6 +1167,10 @@ impl ClaudeCodeProvider {
 }
 
 impl Provider for ClaudeCodeProvider {
+    fn diagnostics(&self) -> Option<serde_json::Value> {
+        self.diagnostics.lock().ok().and_then(|slot| slot.clone())
+    }
+
     fn harness(&self) -> &'static str {
         "claude-code"
     }
@@ -1105,6 +1255,8 @@ impl Provider for ClaudeCodeProvider {
         let mut history = Vec::<serde_json::Value>::new();
         let (mut input_tokens, mut output_tokens) = (0_u64, 0_u64);
         let mut served_model = model.to_string();
+        let tool_names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
+        let mut asked_again = false;
 
         for _ in 0..MAX_ITERATIONS {
             let spent = input_tokens + output_tokens;
@@ -1136,6 +1288,29 @@ impl Provider for ClaudeCodeProvider {
             output_tokens += turn.output_tokens;
             served_model = turn.model;
             let Some(action) = parse_harness_action(&turn.text) else {
+                // Three outcomes, not two. A turn that is neither a valid
+                // action nor an answer is a malformed action, and the one
+                // thing never to do with it is say it out loud.
+                if let Some(name) = attempted_tool_call(&turn.text, &tool_names) {
+                    if !asked_again {
+                        asked_again = true;
+                        history.push(json!({
+                            "assistant_unusable_reply": turn.text,
+                            "correction": format!("That named the tool '{name}' in prose. It was NOT executed. Reply again with exactly one JSON object from the response contract: a tool action to call it, or a final action that answers without it."),
+                        }));
+                        continue;
+                    }
+                    // Twice is not a slip. Withhold it and say so in the
+                    // record, rather than publishing machine output and
+                    // calling the run ok.
+                    return Ok(Completion {
+                        text: String::new(),
+                        model: served_model,
+                        outcome: "refused to publish a malformed tool call".into(),
+                        input_tokens,
+                        output_tokens,
+                    });
+                }
                 // Not JSON at all: prose, which is a fine answer.
                 return Ok(Completion {
                     text: turn.text,
@@ -1680,11 +1855,7 @@ fn parse_grok_response(
         + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0)
         + usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
     let output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
-    let served_model = response["modelUsage"]
-        .as_object()
-        .and_then(|models| models.keys().next())
-        .cloned()
-        .unwrap_or_else(|| requested_model.to_string());
+    let (served_model, _) = served_model_from_usage(&response["modelUsage"], requested_model);
     Ok(Completion {
         text: response["text"].as_str().unwrap_or_default().to_string(),
         model: served_model,
@@ -2637,6 +2808,55 @@ impl Provider for MockProvider {
     }
 }
 
+/// Mock that returns the SYSTEM prompt as its text, so a test can assert
+/// what the model was actually told rather than what we meant to tell it.
+pub struct MockSystemEchoProvider;
+
+impl Provider for MockSystemEchoProvider {
+    fn complete(
+        &self,
+        model: &str,
+        system: &str,
+        _prompt: &str,
+        _images: &[ImageInput],
+        _max_tokens: u64,
+    ) -> Result<Completion, crate::Error> {
+        Ok(Completion {
+            text: system.to_string(),
+            model: model.to_string(),
+            outcome: "ok".into(),
+            input_tokens: 1,
+            output_tokens: 1,
+        })
+    }
+}
+
+/// Mock that serves a model other than the one it was asked for — the
+/// behaviour a real CLI shows when it silently substitutes. Exists so the
+/// divergence check has something honest to catch.
+pub struct MockDowngradeProvider;
+
+pub const MOCK_DOWNGRADE_MODEL: &str = "mock-downgraded-model";
+
+impl Provider for MockDowngradeProvider {
+    fn complete(
+        &self,
+        _model: &str,
+        _system: &str,
+        prompt: &str,
+        _images: &[ImageInput],
+        _max_tokens: u64,
+    ) -> Result<Completion, crate::Error> {
+        Ok(Completion {
+            text: format!("[downgraded] {prompt}"),
+            model: MOCK_DOWNGRADE_MODEL.to_string(),
+            outcome: "ok".into(),
+            input_tokens: prompt.len() as u64 / 4,
+            output_tokens: 16,
+        })
+    }
+}
+
 /// Mock that exercises the tool path: calls each tool once (first required
 /// property = the prompt), then reports the results. Tests the full
 /// dispatch + logging pipeline without a network.
@@ -2806,6 +3026,8 @@ pub fn bind(
         }
         "ollama" => Ok(Box::new(OllamaProvider::default())),
         "mock" => Ok(Box::new(MockProvider)),
+        "mock-system-echo" => Ok(Box::new(MockSystemEchoProvider)),
+        "mock-downgrade" => Ok(Box::new(MockDowngradeProvider)),
         "mock-tool" => Ok(Box::new(MockToolProvider)),
         "mock-tool-fail" => Ok(Box::new(MockToolFailProvider)),
         other => Err(crate::Error::Provider(format!(
@@ -3223,6 +3445,112 @@ mod openai_tests {
         assert_eq!(content[0]["thinking"], "");
         assert_eq!(content[0]["signature"], "OPAQUE");
         assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn model_notes_keep_the_explanation_and_drop_the_rest() {
+        let stderr = "\
+starting up\n\
+Warning: model claude-sonnet-5 is not available on this plan, falling back\n\
+Authorization: Bearer sk-ant-secret-value-nobody-should-log\n\
+compiling tools\n";
+        let notes = model_choice_notes(stderr);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("not available"));
+        // The filter is the point: unrelated lines, and anything that
+        // happens to be sitting in an untrusted process's stderr, stay out
+        // of a signed log that replicates to relays.
+        assert!(!notes.iter().any(|n| n.contains("sk-ant")));
+        assert!(!notes.iter().any(|n| n.contains("compiling tools")));
+    }
+
+    #[test]
+    fn model_notes_are_bounded_in_count_and_length() {
+        let noisy = (0..50)
+            .map(|i| format!("model note {i} {}", "x".repeat(400)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let notes = model_choice_notes(&noisy);
+        assert!(notes.len() <= 5, "{}", notes.len());
+        assert!(notes.iter().all(|n| n.chars().count() <= 201), "{notes:?}");
+    }
+
+    #[test]
+    fn a_clean_run_has_nothing_to_explain() {
+        assert!(model_choice_notes("compiling\ndone\n").is_empty());
+    }
+
+    #[test]
+    fn a_function_call_missing_its_kind_is_a_tool_action() {
+        // Published into Scout's DM at 20:31 on 12 Sep, outcome ok.
+        let leaked = r#"<request for tool call> {"name":"web_fetch","arguments":{"url":"https://www.coffeeforums.co.uk/forums/home-roasting.11/"}}"#;
+        let action = parse_harness_action(leaked).expect("a tool call is in there");
+        assert_eq!(action["kind"], "tool");
+        assert_eq!(action["name"], "web_fetch");
+        assert_eq!(
+            action["arguments"]["url"],
+            "https://www.coffeeforums.co.uk/forums/home-roasting.11/"
+        );
+        // Anthropic's spelling of the same thing.
+        let input = r#"{"name":"vault_read","input":{"path":"a.md"}}"#;
+        let action = parse_harness_action(input).unwrap();
+        assert_eq!(action["kind"], "tool");
+        assert_eq!(action["arguments"]["path"], "a.md");
+        // A name with no argument object is still just data.
+        assert!(parse_harness_action(r#"Use {"name":"whatever"} here."#).is_none());
+    }
+
+    #[test]
+    fn the_requested_model_is_credited_when_it_was_billed() {
+        // What Claude Code reported for a sonnet-5 run: its background
+        // model listed first.
+        let usage = json!({"claude-haiku-4-5-20251001": {}, "claude-sonnet-5": {}});
+        let (served, billed) = served_model_from_usage(&usage, "claude-sonnet-5");
+        assert_eq!(served, "claude-sonnet-5");
+        assert_eq!(billed.len(), 2);
+    }
+
+    #[test]
+    fn a_model_chosen_instead_of_the_request_is_still_named() {
+        let usage = json!({"claude-haiku-4-5-20251001": {}});
+        let (served, _) = served_model_from_usage(&usage, "claude-sonnet-5");
+        assert_eq!(served, "claude-haiku-4-5-20251001");
+        let (served, billed) = served_model_from_usage(&json!(null), "claude-sonnet-5");
+        assert_eq!(served, "claude-sonnet-5");
+        assert!(billed.is_empty());
+    }
+
+    #[test]
+    fn a_tool_call_written_as_prose_is_not_an_answer() {
+        // The exact string Scout published into a channel on 12 Sep, where
+        // the record said outcome=ok and response_chars=71.
+        let leaked = r#"tool call: web_fetch | {"url":"https://www.nativesonsroasters.com"}"#;
+        let tools = vec!["web_fetch".to_string(), "vault_write".to_string()];
+        assert_eq!(
+            attempted_tool_call(leaked, &tools).as_deref(),
+            Some("web_fetch")
+        );
+        // And the variant it produced at 19:24 the same day — the label
+        // changes between leaks, so the detector must not key on it.
+        let again = r#"tool_call: web_fetch | {"url":"https://old.reddit.com/r/roasting/"}"#;
+        assert_eq!(
+            attempted_tool_call(again, &tools).as_deref(),
+            Some("web_fetch")
+        );
+    }
+
+    #[test]
+    fn prose_that_merely_mentions_a_tool_is_still_an_answer() {
+        let tools = vec!["web_fetch".to_string()];
+        // Naming a tool while explaining yourself is normal and must not be
+        // withheld — the signature is a brace right behind the name.
+        assert!(
+            attempted_tool_call("I used web_fetch to check their site; it 404s.", &tools).is_none()
+        );
+        assert!(attempted_tool_call("No tools were needed for that.", &tools).is_none());
+        // A long essay that happens to contain a snippet is not a call.
+        let essay = "x".repeat(700) + r#" web_fetch {"url":"…"}"#;
+        assert!(attempted_tool_call(&essay, &tools).is_none());
     }
 
     #[test]

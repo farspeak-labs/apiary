@@ -115,15 +115,14 @@ apiary manifest validate /tmp/<name>.yaml
 cp /tmp/<name>.yaml ~/.apiary/agents/<npub>/manifest.yaml
 ```
 
-Landing it unratified is correct — `manifest.yaml` is the proposal and
-`manifest.approved.yaml` is the contract. The agent will not run until a
-human signs. Confirm the two differ:
+Landing it unratified is correct — `manifest.yaml` is the proposal, and
+the agent will not run until a human signs **that exact file**.
 
-```bash
-D=~/.apiary/agents/<npub>
-[ "$(shasum -a 256 < $D/manifest.yaml)" = "$(shasum -a 256 < $D/manifest.approved.yaml)" ] \
-  && echo "ratified" || echo "awaiting the governor"
-```
+Do not judge that by comparing `manifest.yaml` with
+`manifest.approved.yaml`. The approved file is a snapshot kept for showing
+diffs; admission is decided by signed events in the agent's log, and the
+two can disagree. Ask the gate itself — the cockpit's ratified badge, or
+`ratified` from `GET /api/agents/<npub>/manifest`.
 
 ## 4. The human ratifies and activates
 
@@ -148,6 +147,15 @@ entry has all 46 tools ticked, the new grant gets all 46. Trim
 it against the agent's own constitution — an agent whose skills say "no
 access to customer data" holding `tenants_list` is a contradiction that no
 test will catch.
+
+**An agent can hold many MCP servers — one grant per library entry.**
+Granting a second server no longer replaces the first. Grants are addressed
+by library name in the cockpit and the API, so give every server its own;
+two grants sharing a name will not validate, and addressing "the mcp
+connector" of an agent with several is refused as ambiguous rather than
+guessed. The model sees each tool as `mcp_<server>_<tool>`, so ControlPanel
+and a search server never hand it two tools called `search`. Every other
+kind (`web-fetch`, vaults) is still one per kind.
 
 ## 6. Make it reachable
 
@@ -189,20 +197,24 @@ proactive allowance is inert and says so on the Watches endpoint.
 that chose not to look are different problems with the same symptom, and
 asking the agent tells you nothing — it answers from its prompt.
 
-**A capability that cannot bind fails the whole run, not just itself.**
-Connectors are bound before inference, and `bind_connectors_in` returns an
-error rather than skipping a broken one — so a half-configured capability
-stops the agent answering anything at all. Two that bite:
+**An MCP server that cannot bind is skipped, not fatal — every other kind
+still is.** MCP servers bind in parallel before inference, each listing its
+tools. One that is down, unauthorized, or misconfigured is recorded in the
+run's `tools_dropped` ("<server>: server did not bind …") and the run goes
+ahead with the rest, because an agent holding many servers would otherwise
+answer nothing whenever one was unreachable. The cockpit shows it on the
+run's row. Read it: a skipped server is silent in the chat, and the agent
+will correctly say it lacks those tools.
+
+Other kinds still fail the whole run when they cannot bind:
 
 - `web-search` **errors without its Brave API key**. Never add it as a
   placeholder ahead of the credential.
-- `mcp` **connects at bind time** to list tools, so an entry with a URL and
-  tools but no sealed credential 401s and takes every run down with it. The
-  one safe way to stage one is with an empty `allowed_tools`: that returns
-  early, before connecting, which is why an empty allowlist is valid-but-inert
-  rather than an error.
 
-Grant the credential and the tools together, or stage neither.
+For MCP, staging a server before its credential no longer breaks the agent,
+but it does put a failure in every run record until the credential arrives.
+An empty `allowed_tools` is still the clean way to stage one: it returns
+before connecting.
 
 **A tool policy of `read-write` does not mean the tool writes.** That flag
 governs whether Apiary will call a tool the server did not declare read-only.
@@ -212,6 +224,15 @@ ticked. Read the tool NAMES before promising an agent can write anywhere.
 
 **Agent claims it lacks access it has** → same check. Trust the log, not the
 agent's self-report.
+
+**Never roll a manifest back by copying old bytes.** The gate used to ask
+whether a manifest had *ever* been ratified, so writing a superseded
+manifest back put it in force with no new signature — over the governor's
+later decision — and the cockpit badged it "Approved" with no approve button
+to click. It now admits only the latest ratification, so restored bytes stop
+the agent until they are signed again. On a host without that fix, restoring
+old bytes silently reverses a governance decision. To go back, stage the old
+content and have it ratified as a new decision.
 
 ## Agents with a coding harness
 
